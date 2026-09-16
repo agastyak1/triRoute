@@ -8,6 +8,7 @@ logs/
 *.log
 credentials.json
 session_cache.db
+__pycache__/
 
 # OS / editor noise
 .DS_Store

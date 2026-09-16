@@ -13,6 +13,7 @@
 import functools
 import sys
 import os
+import binascii
 import json
 import time
 import datetime
@@ -21,9 +22,33 @@ import asyncio
 import base64
 import ssl
 import sqlite3
+import tempfile
 import urllib.request
 import urllib.parse
 import threading
+
+# --- 0. TriRoute hardening: fail-closed master key + OAuth sentinel ---
+_INSECURE_MASTER_KEYS = {
+    "",
+    "sk-quota-gateway-master-key",
+    "sk-change-me-use-a-random-value",
+    "sk-1234",
+    "sk-12345",
+}
+
+def _master_key_ok(key):
+    """Pure predicate (unit-testable): reject unset/weak/known-default keys."""
+    if not key or key in _INSECURE_MASTER_KEYS or any(ch.isspace() for ch in key):
+        return False
+    return len(key) >= 32
+
+if not _master_key_ok(os.environ.get("LITELLM_MASTER_KEY", "")):
+    sys.stderr.write(
+        "[sitecustomize] FATAL: LITELLM_MASTER_KEY is unset, shorter than 32 chars,\n"
+        "[sitecustomize] contains whitespace, or is a known upstream default (TG-004).\n"
+        "[sitecustomize] Generate one with `openssl rand -hex 32` and set it in config/.env\n")
+    os._exit(78)
+
 import httpx
 
 import litellm
@@ -72,28 +97,6 @@ try:
 except Exception as _e:
     print(f"[sitecustomize] litellm mcp patch skipped: {_e}", file=sys.stderr)
 
-# --- 0. TriRoute hardening: fail-closed master key + OAuth sentinel ---
-_INSECURE_MASTER_KEYS = {
-    "",
-    "sk-quota-gateway-master-key",
-    "sk-change-me-use-a-random-value",
-    "sk-1234",
-    "sk-12345",
-}
-
-def _master_key_ok(key):
-    """Pure predicate (unit-testable): reject unset/short/known-default keys."""
-    if not key or key in _INSECURE_MASTER_KEYS:
-        return False
-    return len(key) >= 16
-
-if not _master_key_ok(os.environ.get("LITELLM_MASTER_KEY", "")):
-    sys.stderr.write(
-        "[sitecustomize] FATAL: LITELLM_MASTER_KEY is unset, shorter than 16 chars,\n"
-        "[sitecustomize] or a known upstream default (TG-004). Generate one with\n"
-        "[sitecustomize] `openssl rand -hex 32` and set it in config/.env\n")
-    os._exit(78)
-
 # Sentinel resolved by `os.environ/ANTHROPIC_OAUTH_TOKEN` in litellm.yaml.
 # It keeps LiteLLM's native OAuth header logic (Bearer + oauth beta) and the
 # live, auto-refreshed token is swapped in at header-build time (see 2b).
@@ -123,27 +126,87 @@ except ImportError:
 
 _cred_write_lock = threading.Lock()
 _cred_mtime = 0.0
+_CREDENTIAL_LOCK_TIMEOUT = 30
+_CREDENTIAL_LOCK_STALE = 10 * 60
 
-def _load_credentials_file():
+def _read_credentials_file():
     try:
         with open(CREDENTIALS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        if not isinstance(data, dict):
+            return {}, False
+        return data, True
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, OSError):
+        return {}, False
+
+
+def _load_credentials_file():
+    return _read_credentials_file()[0]
+
+
+def _lock_credentials_file():
+    directory = os.path.dirname(os.path.abspath(CREDENTIALS_FILE)) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    lock_dir = CREDENTIALS_FILE + ".lockdir"
+    deadline = time.monotonic() + _CREDENTIAL_LOCK_TIMEOUT
+    while True:
+        try:
+            os.mkdir(lock_dir, 0o700)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_dir).st_mtime > _CREDENTIAL_LOCK_STALE:
+                    os.rmdir(lock_dir)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out waiting for the credentials writer lock")
+            time.sleep(0.05)
+    lock_path = CREDENTIALS_FILE + ".lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.chmod(lock_path, 0o600)
+        if _fcntl:
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+        return fd, lock_dir
+    except Exception:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+        raise
+
+
+def _unlock_credentials_file(lock):
+    fd, lock_dir = lock
+    try:
+        if _fcntl:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
 
 # --- 1c. persist refreshed tokens to the local credentials.json (atomic + flock) ---
-def _persist_tokens_to_secret(updates: dict):
+def _persist_tokens_to_secret(updates: dict, lock_fd=None):
     if not updates:
         return
     with _cred_write_lock:
-        fd = None
+        lock = lock_fd
+        owns_lock = lock is None
         try:
-            os.makedirs(os.path.dirname(CREDENTIALS_FILE) or ".", exist_ok=True)
-            fd = os.open(CREDENTIALS_FILE + ".lock", os.O_CREAT | os.O_WRONLY, 0o600)
-            if _fcntl:
-                _fcntl.flock(fd, _fcntl.LOCK_EX)
-            creds = _load_credentials_file()
+            if owns_lock:
+                lock = _lock_credentials_file()
+            creds, readable = _read_credentials_file()
+            if not readable:
+                raise RuntimeError(
+                    "credentials file is unreadable; refusing to overwrite it"
+                )
             for env_name, value in updates.items():
                 mapping = _ENV_TO_PROVIDER.get(env_name)
                 if not mapping or not value:
@@ -153,13 +216,28 @@ def _persist_tokens_to_secret(updates: dict):
                 entry[field] = value
                 if field == "access":
                     entry.setdefault("authorizedAt", int(time.time() * 1000))
-            tmp = CREDENTIALS_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
+            directory = os.path.dirname(os.path.abspath(CREDENTIALS_FILE)) or "."
+            tmp_fd, tmp = tempfile.mkstemp(
+                prefix=os.path.basename(CREDENTIALS_FILE) + ".", suffix=".tmp", dir=directory
+            )
+            os.fchmod(tmp_fd, 0o600)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                tmp_fd = None
                 json.dump(creds, fh, indent=2)
+                fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.chmod(tmp, 0o600)
             os.replace(tmp, CREDENTIALS_FILE)
+            tmp = None
+            os.chmod(CREDENTIALS_FILE, 0o600)
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
             try:
                 global _cred_mtime
                 _cred_mtime = os.stat(CREDENTIALS_FILE).st_mtime
@@ -168,10 +246,15 @@ def _persist_tokens_to_secret(updates: dict):
         except Exception as e:
             print(f"[TokenManager] Warning: failed to persist credentials file: {e}", file=sys.stderr)
         finally:
-            if fd is not None:
-                if _fcntl:
-                    _fcntl.flock(fd, _fcntl.LOCK_UN)
-                os.close(fd)
+            if "tmp_fd" in locals() and tmp_fd is not None:
+                os.close(tmp_fd)
+            if "tmp" in locals() and tmp:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+            if owns_lock and lock is not None:
+                _unlock_credentials_file(lock)
 
 
 # --- 2. Token manager: file-backed state, race-safe rotating refresh ---
@@ -213,24 +296,25 @@ class TokenManager:
         except OSError:
             _cred_mtime = 0.0
 
-        def take(provider, field, keep):
+        def take(provider, field, fallback=""):
             entry = creds.get(provider)
             if isinstance(entry, dict):
                 value = entry.get(field)
                 if isinstance(value, str) and value:
                     return value
-            return keep
+            return fallback
 
-        self._anthropic_token = take("anthropic", "access", self._anthropic_token)
-        self._anthropic_refresh = take("anthropic", "refresh", self._anthropic_refresh)
-        self._codex_token = take("openai-codex", "access", self._codex_token)
-        self._codex_refresh = take("openai-codex", "refresh", self._codex_refresh)
-        self._google_token = take("google-antigravity", "access", self._google_token)
-        self._google_refresh = take("google-antigravity", "refresh", self._google_refresh)
+        self._anthropic_token = take("anthropic", "access")
+        self._anthropic_refresh = take("anthropic", "refresh")
+        self._codex_token = take("openai-codex", "access")
+        self._codex_refresh = take("openai-codex", "refresh")
+        self._google_token = take("google-antigravity", "access")
+        self._google_refresh = take("google-antigravity", "refresh")
         self._google_project_id = take(
             "google-antigravity", "projectId",
-            self._google_project_id or os.environ.get("GOOGLE_ANTIGRAVITY_PROJECT_ID", ""),
+            os.environ.get("GOOGLE_ANTIGRAVITY_PROJECT_ID", ""),
         )
+        self._expires_at = {"anthropic": 0.0, "codex": 0.0, "google": 0.0}
         for provider, key in (("anthropic", "anthropic"), ("openai-codex", "codex"), ("google-antigravity", "google")):
             entry = creds.get(provider)
             expires = entry.get("expires") if isinstance(entry, dict) else None
@@ -284,8 +368,8 @@ class TokenManager:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _do_refresh(self, key):
-        """Execute one provider refresh. Callers must hold self._lock."""
+    def _do_refresh(self, key, lock_fd=None):
+        """Execute one provider refresh while the shared file lock is held."""
         now = time.time()
         try:
             if key == "anthropic":
@@ -305,7 +389,7 @@ class TokenManager:
                     "ANTHROPIC_OAUTH_TOKEN": self._anthropic_token,
                     "ANTHROPIC_REFRESH_TOKEN": self._anthropic_refresh,
                     "ANTHROPIC_EXPIRES_MS": int(self._expires_at["anthropic"] * 1000),
-                })
+                }, lock_fd=lock_fd)
             elif key == "codex":
                 res = self._post_form(
                     "https://auth.openai.com/oauth/token",
@@ -319,7 +403,7 @@ class TokenManager:
                     "OPENAI_CODEX_OAUTH_TOKEN": self._codex_token,
                     "OPENAI_CODEX_REFRESH_TOKEN": self._codex_refresh,
                     "OPENAI_CODEX_EXPIRES_MS": int(self._expires_at["codex"] * 1000),
-                })
+                }, lock_fd=lock_fd)
             elif key == "google":
                 res = self._post_form(
                     "https://oauth2.googleapis.com/token",
@@ -328,11 +412,13 @@ class TokenManager:
                      "refresh_token": self._google_refresh},
                 )
                 self._google_token = res.get("access_token") or self._google_token
+                self._google_refresh = res.get("refresh_token") or self._google_refresh
                 self._expires_at["google"] = now + float(res.get("expires_in", 3600)) - 60
                 _persist_tokens_to_secret({
                     "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN": self._google_token,
+                    "GOOGLE_ANTIGRAVITY_REFRESH_TOKEN": self._google_refresh,
                     "GOOGLE_ANTIGRAVITY_EXPIRES_MS": int(self._expires_at["google"] * 1000),
-                })
+                }, lock_fd=lock_fd)
             else:
                 return False
             print(f"[TokenManager] {key} token refreshed", file=sys.stderr)
@@ -342,31 +428,55 @@ class TokenManager:
             return False
 
     def _get(self, key, token_getter, token_setter):
-        self._sync_if_file_changed()
         with self._lock:
+            self._sync_if_file_changed()
             if self._needs_refresh(key):
-                self._do_refresh(key)
+                fd = _lock_credentials_file()
+                try:
+                    # Another process may have rotated the one-use grant while
+                    # this request was waiting for the lock. Adopt that state
+                    # before deciding whether a refresh is still necessary.
+                    self.reload()
+                    if self._needs_refresh(key):
+                        self._do_refresh(key, lock_fd=fd)
+                finally:
+                    _unlock_credentials_file(fd)
             setattr(self, f"_last_touch_{key}", time.time())
             return token_getter()
 
     def get_anthropic_token(self, force_refresh=False):
         if force_refresh:
             with self._lock:
-                self._do_refresh("anthropic")
+                fd = _lock_credentials_file()
+                try:
+                    self.reload()
+                    self._do_refresh("anthropic", lock_fd=fd)
+                finally:
+                    _unlock_credentials_file(fd)
                 return self._anthropic_token
         return self._get("anthropic", lambda: self._anthropic_token, None)
 
     def get_codex_token(self, force_refresh=False):
         if force_refresh:
             with self._lock:
-                self._do_refresh("codex")
+                fd = _lock_credentials_file()
+                try:
+                    self.reload()
+                    self._do_refresh("codex", lock_fd=fd)
+                finally:
+                    _unlock_credentials_file(fd)
                 return self._codex_token
         return self._get("codex", lambda: self._codex_token, None)
 
     def get_google_token(self, force_refresh=False):
         if force_refresh:
             with self._lock:
-                self._do_refresh("google")
+                fd = _lock_credentials_file()
+                try:
+                    self.reload()
+                    self._do_refresh("google", lock_fd=fd)
+                finally:
+                    _unlock_credentials_file(fd)
                 return self._google_token
         return self._get("google", lambda: self._google_token, None)
 
@@ -393,28 +503,32 @@ def _open_sig_db():
         return None
 
 _sig_db = _open_sig_db()
+_sig_db_lock = threading.Lock()
 if _sig_db is not None:
-    try:
-        _sig_db.execute("DELETE FROM thought_signatures WHERE updated_at < ?", (time.time() - 86400,))
-        for _cid, _sig in _sig_db.execute("SELECT call_id, signature FROM thought_signatures"):
-            _thought_signatures[_cid] = _sig
-        print(f"[sitecustomize] session cache: loaded {len(_thought_signatures)} thoughtSignatures", file=sys.stderr)
-    except Exception as _load_err:
-        print(f"[sitecustomize] WARNING: session cache load failed: {_load_err}", file=sys.stderr)
+    with _sig_db_lock:
+        try:
+            _sig_db.execute("DELETE FROM thought_signatures WHERE updated_at < ?", (time.time() - 86400,))
+            _sig_db.commit()
+            for _cid, _sig in _sig_db.execute("SELECT call_id, signature FROM thought_signatures"):
+                _thought_signatures[_cid] = _sig
+            print(f"[sitecustomize] session cache: loaded {len(_thought_signatures)} thoughtSignatures", file=sys.stderr)
+        except Exception as _load_err:
+            print(f"[sitecustomize] WARNING: session cache load failed: {_load_err}", file=sys.stderr)
 
 def _remember_thought_signature(call_id, signature):
     if not call_id or not signature:
         return
-    _thought_signatures[call_id] = signature
-    if _sig_db is None:
-        return
-    try:
-        _sig_db.execute(
-            "INSERT OR REPLACE INTO thought_signatures (call_id, signature, updated_at) VALUES (?,?,?)",
-            (call_id, signature, time.time()))
-        _sig_db.commit()
-    except Exception:
-        pass
+    with _sig_db_lock:
+        _thought_signatures[call_id] = signature
+        if _sig_db is None:
+            return
+        try:
+            _sig_db.execute(
+                "INSERT OR REPLACE INTO thought_signatures (call_id, signature, updated_at) VALUES (?,?,?)",
+                (call_id, signature, time.time()))
+            _sig_db.commit()
+        except Exception as _sig_err:
+            print(f"[sitecustomize] WARNING: session cache write failed: {_sig_err}", file=sys.stderr)
 
 # --- 2b. Anthropic OAuth sentinel swap for LiteLLM's native /v1/messages path ---
 # litellm.yaml resolves `os.environ/ANTHROPIC_OAUTH_TOKEN` once at config load,
@@ -623,7 +737,6 @@ def _inject_claude_prompt(kwargs, args=None):
     fresh_anthropic_token = _token_manager.get_anthropic_token()
     if fresh_anthropic_token:
         kwargs["api_key"] = fresh_anthropic_token
-        os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
     extra_headers = kwargs.setdefault("extra_headers", {})
     if isinstance(extra_headers, dict):
@@ -769,7 +882,7 @@ def _extract_account_id(tok):
         padded = parts[1] + ("=" * (4 - padding) if padding else "")
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
         return payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-    except:
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error):
         return None
 
 def _build_codex_headers(tok):
@@ -880,6 +993,8 @@ def _tools_to_codex_tools(tools):
 def _codex_tool_choice(choice):
     if not isinstance(choice, dict):
         return choice
+    if choice.get("type") in ("auto", "none", "required"):
+        return choice["type"]
     function = choice.get("function")
     if choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
         return {"type": "function", "name": function["name"]}
@@ -978,12 +1093,26 @@ async def _logged_bridge_stream(generator, logging_obj, messages, start_time):
     except Exception as log_err:
         print(f"[sitecustomize] bridge stream spend log failed: {log_err}", file=sys.stderr)
 
+def _sse_data(line):
+    """Return one SSE data field, accepting both `data:` and `data: ` forms."""
+    line_str = line.strip()
+    if not line_str.startswith("data:"):
+        return None
+    return line_str[5:].lstrip()
+
 def _strip_codex_output_limits(kwargs):
+    limit = None
     for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+        if limit is None and isinstance(kwargs.get(key), (int, float)) and kwargs[key] > 0:
+            limit = int(kwargs[key])
         kwargs.pop(key, None)
     if isinstance(kwargs.get("extra_body"), dict):
         for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+            if limit is None and isinstance(kwargs["extra_body"].get(key), (int, float)) and kwargs["extra_body"][key] > 0:
+                limit = int(kwargs["extra_body"][key])
             kwargs["extra_body"].pop(key, None)
+    if limit is not None:
+        kwargs["_triroute_max_output_tokens"] = limit
 
 def _codex_request_body(model, messages, tools, extra_kwargs):
     body = {
@@ -1000,12 +1129,22 @@ def _codex_request_body(model, messages, tools, extra_kwargs):
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
         effort = extra_kwargs.get("reasoning_effort")
+        if effort is None:
+            effort = "low" if model.endswith("-luna") else "medium" if model.endswith("-terra") else None
         if effort is not None:
             body["reasoning"] = {
                 "effort": str(effort).lower(),
                 "summary": "auto",
                 "context": "all_turns",
             }
+        output_limit = extra_kwargs.get("_triroute_max_output_tokens")
+        if output_limit is None:
+            for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+                if isinstance(extra_kwargs.get(key), (int, float)) and extra_kwargs[key] > 0:
+                    output_limit = int(extra_kwargs[key])
+                    break
+        if isinstance(output_limit, int) and output_limit > 0:
+            body["max_output_tokens"] = output_limit
         if extra_kwargs.get("service_tier") is not None:
             body["service_tier"] = extra_kwargs["service_tier"]
     return body
@@ -1019,6 +1158,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     tool_calls = []
     active_tools = {}
     usage_meta = {}
+    stream_terminated = False
 
     with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
@@ -1036,13 +1176,15 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
             raise Exception(f"OpenAI Codex error {resp.status_code}: {err_text}")
 
         for line in resp.iter_lines():
-            line_str = line.strip()
-            if line_str.startswith("data: "):
-                data_str = line_str[6:].strip()
+            data_str = _sse_data(line)
+            if data_str is not None:
                 if data_str == "[DONE]":
+                    stream_terminated = True
                     break
                 try:
                     event = json.loads(data_str)
+                    if not isinstance(event, dict):
+                        raise ValueError("event is not an object")
                     etype = event.get("type")
                     if etype == "response.output_item.added":
                         item = event.get("item", {})
@@ -1069,14 +1211,18 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
                         full_text.append(event.get("delta", ""))
                     elif etype == "response.completed":
                         usage_meta = event.get("response", {}).get("usage") or {}
+                        stream_terminated = True
                     elif etype in ["response.failed", "error"]:
                         err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
                         raise Exception(f"OpenAI Codex stream failed: {err_obj}")
                 except Exception as parse_err:
                     if "OpenAI Codex stream failed" in str(parse_err):
                         raise parse_err
-                    pass
+                    raise RuntimeError(f"OpenAI Codex stream parse failed: {parse_err}") from parse_err
         resp.close()
+
+    if not stream_terminated:
+        raise RuntimeError("OpenAI Codex stream ended without a completion event")
 
     return "".join(full_text), tool_calls, _codex_usage(usage_meta)
 async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
@@ -1091,6 +1237,7 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
     has_tool_calls = False
     completion_status = "completed"
     usage_meta = {}
+    stream_terminated = False
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
@@ -1108,13 +1255,15 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
             raise Exception(f"OpenAI Codex error {resp.status_code}: {err_text}")
 
         async for line in resp.aiter_lines():
-            line_str = line.strip()
-            if line_str.startswith("data: "):
-                data_str = line_str[6:].strip()
+            data_str = _sse_data(line)
+            if data_str is not None:
                 if data_str == "[DONE]":
+                    stream_terminated = True
                     break
                 try:
                     event = json.loads(data_str)
+                    if not isinstance(event, dict):
+                        raise ValueError("event is not an object")
                     etype = event.get("type")
 
                     if etype == "response.output_item.added":
@@ -1202,14 +1351,17 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                         resp_data = event.get("response", {})
                         completion_status = resp_data.get("status", "completed")
                         usage_meta = resp_data.get("usage") or {}
+                        stream_terminated = True
                     elif etype in ["response.failed", "error"]:
                         err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
                         raise Exception(f"OpenAI Codex stream failed: {err_obj}")
                 except Exception as parse_err:
                     if "OpenAI Codex stream failed" in str(parse_err):
                         raise parse_err
-                    pass
+                    raise RuntimeError(f"OpenAI Codex stream parse failed: {parse_err}") from parse_err
         await resp.aclose()
+    if not stream_terminated:
+        raise RuntimeError("OpenAI Codex stream ended without a completion event")
     finish_reason = "tool_calls" if has_tool_calls else ("length" if completion_status == "incomplete" else "stop")
     yield ModelResponseStream(
         id=resp_id,
@@ -1396,6 +1548,7 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
     full_text = []
     tool_calls = []
     usage_meta = {}
+    stream_terminated = False
 
     with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
@@ -1407,24 +1560,21 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
                 resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
-            resp.close()
-            payload["model"] = "gemini-3.7-flash-low"
-            resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
-
         if resp.status_code != 200:
             err_text = resp.read().decode("utf-8", "replace")
             resp.close()
             raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
 
         for line in resp.iter_lines():
-            line_str = line.strip()
-            if line_str.startswith("data: "):
-                data_str = line_str[6:].strip()
+            data_str = _sse_data(line)
+            if data_str is not None:
                 if data_str == "[DONE]":
+                    stream_terminated = True
                     break
                 try:
                     event = json.loads(data_str)
+                    if not isinstance(event, dict):
+                        raise ValueError("event is not an object")
                     resp_obj = event.get("response", {})
                     candidates = resp_obj.get("candidates", [])
                     if candidates:
@@ -1449,9 +1599,14 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
                     usage = resp_obj.get("usageMetadata", {})
                     if usage:
                         usage_meta = usage
-                except:
-                    pass
+                    if candidates and candidates[0].get("finishReason"):
+                        stream_terminated = True
+                except Exception as parse_err:
+                    raise RuntimeError(f"Google Antigravity stream parse failed: {parse_err}") from parse_err
         resp.close()
+
+    if not stream_terminated:
+        raise RuntimeError("Google Antigravity stream ended without a completion event")
 
     return "".join(full_text), tool_calls, _google_usage(usage_meta)
 
@@ -1470,6 +1625,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
     current_tool_index = 0
     has_tool_calls = False
     usage_meta = {}
+    stream_terminated = False
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
@@ -1481,24 +1637,21 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                 resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
-            await resp.aclose()
-            payload["model"] = "gemini-3.7-flash-low"
-            resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
-
         if resp.status_code != 200:
             err_text = (await resp.aread()).decode("utf-8", "replace")
             await resp.aclose()
             raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
 
         async for line in resp.aiter_lines():
-            line_str = line.strip()
-            if line_str.startswith("data: "):
-                data_str = line_str[6:].strip()
+            data_str = _sse_data(line)
+            if data_str is not None:
                 if data_str == "[DONE]":
+                    stream_terminated = True
                     break
                 try:
                     event = json.loads(data_str)
+                    if not isinstance(event, dict):
+                        raise ValueError("event is not an object")
                     resp_obj = event.get("response", {})
                     usage_meta = resp_obj.get("usageMetadata") or usage_meta
                     candidates = resp_obj.get("candidates", [])
@@ -1562,11 +1715,16 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                                         ),
                                         finish_reason=None
                                     )]
-                                )
+                                 )
                                 current_tool_index += 1
-                except Exception as e:
-                    pass
+                        if candidates and candidates[0].get("finishReason"):
+                            stream_terminated = True
+                except Exception as parse_err:
+                    raise RuntimeError(f"Google Antigravity stream parse failed: {parse_err}") from parse_err
         await resp.aclose()
+
+    if not stream_terminated:
+        raise RuntimeError("Google Antigravity stream ended without a completion event")
 
     finish_reason = "tool_calls" if has_tool_calls else "stop"
     yield ModelResponseStream(
@@ -1813,4 +1971,5 @@ try:
         print(f"[sitecustomize] Warning registering Anthropic callback: {_cb_err}", file=sys.stderr)
     print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity with auto-refresh and StreamingChoices enabled", file=sys.stderr)
 except Exception as _e:
-    print(f"[sitecustomize] Failed to load litellm bridges: {_e}", file=sys.stderr)
+    print(f"[sitecustomize] FATAL: failed to load litellm bridges: {_e}", file=sys.stderr)
+    os._exit(78)

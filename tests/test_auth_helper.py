@@ -11,7 +11,15 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-spec = importlib.util.spec_from_file_location("auth_helper", os.path.join(ROOT, "scripts", "auth_helper.py"))
+SOURCE_PATH = os.path.join(ROOT, "scripts", "auth_helper.py")
+
+
+def read_source():
+    with open(SOURCE_PATH, encoding="utf-8") as fh:
+        return fh.read()
+
+
+spec = importlib.util.spec_from_file_location("auth_helper", SOURCE_PATH)
 ah = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ah)
 
@@ -62,7 +70,7 @@ class EnvParsing(unittest.TestCase):
         module_path = os.path.join(tmp, "scripts", "auth_helper.py")
         os.makedirs(os.path.dirname(module_path))
         with open(module_path, "w") as fh:
-            fh.write(open(os.path.join(ROOT, "scripts", "auth_helper.py")).read())
+            fh.write(read_source())
         spec2 = importlib.util.spec_from_file_location("ah2", module_path)
         mod = importlib.util.module_from_spec(spec2)
         spec2.loader.exec_module(mod)
@@ -78,7 +86,8 @@ class Save(unittest.TestCase):
         path = os.path.join(tmp, "data", "credentials.json")
         ah.save("anthropic", {"access": "a1", "refresh": "r1", "email": "e@x", "plan": None}, path)
         ah.save("openai-codex", {"access": "a2", "expires": 123}, path)
-        saved = json.load(open(path))
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)
         self.assertEqual(set(saved), {"anthropic", "openai-codex"})
         self.assertNotIn("plan", saved["anthropic"], "None/empty values must be dropped")
         self.assertIn("authorizedAt", saved["anthropic"])
@@ -90,15 +99,17 @@ class Save(unittest.TestCase):
         path = os.path.join(tmp, "credentials.json")
         with open(path, "w") as fh:
             fh.write("###")
-        ah.save("anthropic", {"access": "a"}, path)
-        self.assertEqual(json.load(open(path))["anthropic"]["access"], "a")
+        with self.assertRaises(RuntimeError):
+            ah.save("anthropic", {"access": "a"}, path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "###")
 
 
 class ProviderRegistration(unittest.TestCase):
     """Pin the real first-party client registrations (placeholders broke the old plan draft)."""
 
     def test_client_ids_are_the_real_ones(self):
-        src = open(os.path.join(ROOT, "scripts", "auth_helper.py"), encoding="utf-8").read()
+        src = read_source()
         self.assertIn("9d1c250a-e61b-44d9-88ed-5944d1962f5e", src)      # Claude Code
         self.assertIn("app_EMoamEEZ73f0CkXaXp7hrann", src)              # Codex CLI
         self.assertIn("1071006060591-tmhssin2h21lcre235vtolojh4g403ep", src)  # Antigravity
@@ -106,7 +117,7 @@ class ProviderRegistration(unittest.TestCase):
         self.assertNotIn("google-cloudcode-client-id", src)
 
     def test_google_flow_specifics(self):
-        src = open(os.path.join(ROOT, "scripts", "auth_helper.py"), encoding="utf-8").read()
+        src = read_source()
         google = src[src.index("def auth_google"):src.index("_discover_antigravity_project")]
         self.assertNotIn("code_challenge", google,
                          "Antigravity client does not accept PKCE — sending it breaks the redirect")
@@ -115,15 +126,22 @@ class ProviderRegistration(unittest.TestCase):
         self.assertIn("GOOGLE_CLIENT_SECRET", google)
 
     def test_callback_ports_and_paths(self):
-        src = open(os.path.join(ROOT, "scripts", "auth_helper.py"), encoding="utf-8").read()
+        src = read_source()
         for needle in ("http://localhost:54545/callback", "http://localhost:1455/auth/callback",
                        "http://localhost:51121/oauth-callback"):
             self.assertIn(needle, src)
 
     def test_listener_is_loopback(self):
-        src = open(os.path.join(ROOT, "scripts", "auth_helper.py"), encoding="utf-8").read()
-        self.assertIn('Server(("127.0.0.1", port), _CallbackHandler)', src)
-        self.assertNotIn('Server(("", port)', src)
+        src = read_source()
+        self.assertIn('(("127.0.0.1", port), http.server.ThreadingHTTPServer)', src)
+        self.assertIn('(("::1", port), _IPv6HTTPServer)', src)
+        self.assertNotIn('(("", port)', src)
+
+    def test_state_is_required_before_exchange(self):
+        src = read_source()
+        self.assertIn("result[\"state\"] != self.server.expected_state", src)
+        self.assertIn("listener = _start_callback_listener", src)
+        self.assertLess(src.index("listener = _start_callback_listener"), src.index("_open_browser(", src.index("listener = _start_callback_listener")))
 
 
 class CallbackHandler(unittest.TestCase):

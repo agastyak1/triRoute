@@ -19,8 +19,8 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": null,
-      "dangerousDisableAssetCspModification": true
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://127.0.0.1:3737 http://localhost:3737; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "dangerousDisableAssetCspModification": false
     }
   }
 }

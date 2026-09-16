@@ -394,7 +394,7 @@ async function fetchLocalVllm(): Promise<UsageReport | null> {
 
 		const cacheHitPct = promptTotal > 0 ? (promptHits / promptTotal) * 100 : 0;
 
-		let vramUsedFraction = 0.931;
+		let vramUsedFraction: number | undefined;
 		try {
 			const proc = Bun.spawn(
 				["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
@@ -420,16 +420,10 @@ async function fetchLocalVllm(): Promise<UsageReport | null> {
 			email: "vLLM Instance",
 			plan: "local-gpu",
 			limits: [
-				{
-					id: "vllm:vram_allocation",
-					label: "VRAM Allocated (Weights+KV)",
-					usedFraction: vramUsedFraction,
-				},
-				{
-					id: "vllm:kv_cache",
-					label: "KV Buffer in Active Use",
-					usedFraction: kvUsage,
-				},
+				...(vramUsedFraction === undefined
+					? []
+					: [{ id: "vllm:vram_allocation", label: "VRAM Allocated (Weights+KV)", usedFraction: vramUsedFraction }]),
+				{ id: "vllm:kv_cache", label: "KV Buffer in Active Use", usedFraction: kvUsage },
 			],
 			fetchedAt: Date.now(),
 			extraStats: {

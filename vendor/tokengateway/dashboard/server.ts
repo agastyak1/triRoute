@@ -19,6 +19,50 @@ import { fetchAllUsage, clearCooldown } from "./src/usage";
 import { HTML } from "./src/ui";
 
 const PORT = Number(process.env.PORT ?? 3737);
+const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY?.trim() ?? "";
+const DASHBOARD_COOKIE = "triroute_dashboard_session";
+
+if (!DASHBOARD_API_KEY) {
+	console.error("DASHBOARD_API_KEY is required; refusing to start an unauthenticated dashboard");
+	process.exit(78);
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+	let diff = left.length ^ right.length;
+	const length = Math.max(left.length, right.length);
+	for (let index = 0; index < length; index++) {
+		diff |= (left.charCodeAt(index) || 0) ^ (right.charCodeAt(index) || 0);
+	}
+	return diff === 0;
+}
+
+function bearerKey(req: Request): string | undefined {
+	const authorization = req.headers.get("authorization") ?? "";
+	const match = authorization.match(/^Bearer\s+(.+)$/i);
+	return match?.[1];
+}
+
+function cookieKey(req: Request): string | undefined {
+	const cookies = req.headers.get("cookie") ?? "";
+	for (const part of cookies.split(";")) {
+		const [name, ...value] = part.trim().split("=");
+		if (name !== DASHBOARD_COOKIE) continue;
+		try {
+			return decodeURIComponent(value.join("="));
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+function isAuthorized(req: Request): boolean {
+	return [bearerKey(req), cookieKey(req)].some(value => Boolean(value && constantTimeEqual(value, DASHBOARD_API_KEY)));
+}
+
+function isDashboardMutation(req: Request): boolean {
+	return req.headers.has("authorization") || req.headers.get("x-requested-with") === "triroute-dashboard";
+}
 
 /** In-flight logins, so the UI can poll for completion and surface failures. */
 interface LoginState {
@@ -29,6 +73,15 @@ interface LoginState {
 const logins: Map<string, LoginState> = new Map();
 
 async function handleApi(req: Request, url: URL): Promise<Response> {
+	if (!isAuthorized(req)) {
+		return Response.json(
+			{ error: "dashboard authentication required" },
+			{ status: 401, headers: { "WWW-Authenticate": "Bearer" } },
+		);
+	}
+	if (req.method === "POST" && !isDashboardMutation(req)) {
+		return Response.json({ error: "missing dashboard request header" }, { status: 403 });
+	}
 	if (url.pathname === "/api/status") {
 		const credentials = await loadCredentials();
 		return Response.json({
@@ -48,7 +101,7 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 	}
 	if (url.pathname === "/api/credentials" && req.method === "GET") {
 		const credentials = await loadCredentials();
-		return Response.json(credentials);
+		return Response.json(credentials, { headers: { "cache-control": "no-store" } });
 	}
 	const credProviderMatch = url.pathname.match(/^\/api\/credentials\/([\w-]+)$/);
 	if (credProviderMatch && req.method === "GET") {
@@ -57,7 +110,7 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 		const credentials = await loadCredentials();
 		const cred = credentials[provider];
 		if (!cred) return Response.json({ error: "credential not found" }, { status: 404 });
-		return Response.json(cred);
+		return Response.json(cred, { headers: { "cache-control": "no-store" } });
 	}
 	if (url.pathname === "/api/credentials" && req.method === "POST") {
 		const payload: unknown = await req.json();
@@ -150,7 +203,13 @@ Bun.serve({
 	async fetch(req) {
 		const url = new URL(req.url);
 		if (url.pathname === "/") {
-			return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+			return new Response(HTML, {
+				headers: {
+					"content-type": "text/html; charset=utf-8",
+					"cache-control": "no-store",
+					"set-cookie": `${DASHBOARD_COOKIE}=${encodeURIComponent(DASHBOARD_API_KEY)}; Path=/; HttpOnly; SameSite=Strict`,
+				},
+			});
 		}
 		if (url.pathname.startsWith("/api/")) {
 			try {

@@ -617,7 +617,7 @@ export const HTML = `<!DOCTYPE html>
 <div class="kpi-bar">
   <div class="kpi-item">
     <span class="kpi-label">Providers</span>
-    <span class="kpi-val" id="kpiProviders">3 <span style="font-size:0.75em;color:var(--text-dim)">Cloud</span> + 1 <span style="font-size:0.75em;color:var(--text-dim)">Local</span></span>
+    <span class="kpi-val" id="kpiProviders">--</span>
   </div>
   <div class="kpi-item">
     <span class="kpi-label">Quota Status</span>
@@ -629,7 +629,7 @@ export const HTML = `<!DOCTYPE html>
   </div>
   <div class="kpi-item">
     <span class="kpi-label">Local Cluster</span>
-    <span class="kpi-val" id="kpiLocalVllm" style="color:var(--nvidia)">48 GB <span style="font-size:0.75em;color:var(--text-dim)">3× 5060 Ti</span></span>
+    <span class="kpi-val" id="kpiLocalVllm" style="color:var(--nvidia)">--</span>
   </div>
 </div>
 
@@ -660,6 +660,15 @@ const LOGOS = {
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function esc(value) {
   return String(value == null ? '' : value).replace(/[&<>"']/g, c => ESC_MAP[c]);
+}
+
+function safeHref(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.origin);
+    return /^https?:$/.test(url.protocol) ? esc(url.href) : '';
+  } catch (_) {
+    return '';
+  }
 }
 
 function formatCountdown(targetMs) {
@@ -734,9 +743,14 @@ async function refresh() {
   btn.disabled = true;
 
   try {
+    const fetchJson = async (path) => {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(path + ' returned HTTP ' + response.status);
+      return response.json();
+    };
     const [s, u] = await Promise.all([
-      fetch('/api/status').then(r => r.json()),
-      fetch('/api/usage').then(r => r.json())
+      fetchJson('/api/status'),
+      fetchJson('/api/usage')
     ]);
     state.providers = s.providers || [];
     state.reports = u.reports || [];
@@ -744,7 +758,7 @@ async function refresh() {
     document.getElementById('lastSync').textContent = 'Synced: ' + new Date().toLocaleTimeString();
     render();
   } catch (e) {
-    document.getElementById('cardsContainer').innerHTML = '<div class="err-box" style="grid-column:1/-1">Error: ' + e.message + '</div>';
+    document.getElementById('cardsContainer').innerHTML = '<div class="err-box" style="grid-column:1/-1">Error: ' + esc(e && e.message) + '</div>';
   } finally {
     btn.disabled = false;
   }
@@ -753,41 +767,43 @@ async function refresh() {
 function render() {
   let html = '';
   let saturatedCount = 0;
+  let errorCount = 0;
 
   for (const p of state.providers) {
     const report = state.reports.find(r => r.provider === p.id);
     const isVllm = p.id === 'local-vllm';
+    if (report && report.error) errorCount++;
     
-    html += \`<div class="provider-card \${p.id}">\`;
+    html += \`<div class="provider-card \${esc(p.id)}">\`;
     
     html += \`<div>
       <div class="card-header">
         <div class="provider-meta">
-          <div class="logo-box \${p.id}">\${LOGOS[p.id] || ''}</div>
+           <div class="logo-box \${esc(p.id)}">\${LOGOS[p.id] || ''}</div>
           <div class="provider-title">
-            <span class="provider-name">\${p.label}</span>
-            <span class="provider-email">\${p.email || 'Not authenticated'}</span>
+             <span class="provider-name">\${esc(p.label)}</span>
+             <span class="provider-email">\${esc(p.email || 'Not authenticated')}</span>
           </div>
         </div>
         
         <div class="badge-group">\`;
         
-        if (p.plan) html += \`<span class="pill">\${p.plan}</span>\`;
+        if (p.plan) html += \`<span class="pill">\${esc(p.plan)}</span>\`;
         
         if (report && report.limits && report.limits.length) {
           const worst = Math.max(...report.limits.map(l => l.usedFraction));
           const worstPct = Math.round(worst * 100);
           html += \`<span class="pill peak">
             <span class="pill-dot" style="background:\${getStatusColor(worst)}"></span>
-            \${worstPct}%
+             \${esc(worstPct)}%
           </span>\`;
         }
         
         if (!isVllm) {
           if (p.connected) {
-            html += \`<button class="danger" onclick="logout('\${p.id}')">disconnect</button>\`;
+             html += \`<button class="danger" onclick="logout('\${esc(p.id)}')">disconnect</button>\`;
           } else {
-            html += \`<button class="primary" onclick="login('\${p.id}')">Login</button>\`;
+             html += \`<button class="primary" onclick="login('\${esc(p.id)}')">Login</button>\`;
           }
         }
         
@@ -796,16 +812,16 @@ function render() {
     if (p.login && p.login.status === 'pending') {
       html += \`<div class="pending-panel">
         <p>Open the URL below to authorize:</p>
-        <div class="url-box">\${p.login.url}</div>
+         <div class="url-box">\${esc(p.login.url)}</div>
         <div class="paste-row">
-          <input id="code-\${p.id}" placeholder="Code or code#state">
-          <button class="primary" onclick="submitCode('\${p.id}')">OK</button>
+           <input id="code-\${esc(p.id)}" placeholder="Code or code#state">
+           <button class="primary" onclick="submitCode('\${esc(p.id)}')">OK</button>
         </div>
       </div>\`;
     }
 
     if (p.login && p.login.status === 'error') {
-      html += \`<div class="err-box">\${p.login.message || 'Login error'}</div>\`;
+       html += \`<div class="err-box">\${esc(p.login.message || 'Login error')}</div>\`;
     }
 
     // Quotas progress bars
@@ -815,13 +831,13 @@ function render() {
         if (l.usedFraction >= 0.99) saturatedCount++;
         const pct = Math.min(100, Math.max(0, l.usedFraction * 100));
         html += \`<div class="quota-row">
-          <span class="quota-name">\${l.label}</span>
+           <span class="quota-name">\${esc(l.label)}</span>
           <div class="quota-track">
-            <div class="quota-fill" style="width:\${pct}%;background:\${getGradient(l.usedFraction)}"></div>
+             <div class="quota-fill" style="width:\${esc(pct)}%;background:\${getGradient(l.usedFraction)}"></div>
           </div>
           <div class="quota-stat">
-            <span class="quota-pct" style="color:\${getStatusColor(l.usedFraction)}">\${pct.toFixed(1)}%</span>
-            \${l.resetsAt ? \`<span class="countdown-badge" data-reset-time="\${l.resetsAt}">reset ...</span>\` : ''}
+             <span class="quota-pct" style="color:\${getStatusColor(l.usedFraction)}">\${esc(pct.toFixed(1))}%</span>
+             \${l.resetsAt ? \`<span class="countdown-badge" data-reset-time="\${esc(l.resetsAt)}">reset ...</span>\` : ''}
           </div>
         </div>\`;
       }
@@ -831,19 +847,20 @@ function render() {
     if (report && report.error) {
       if (report.cooldownUntil && report.cooldownUntil > Date.now()) {
         html += \`<div class="err-box" style="display:flex;align-items:center;justify-content:space-between;gap:6px">
-          <span>⚠️ Rate limited while fetching quota</span>
-          <span class="countdown-badge urgent" style="font-weight:600">cooldown: <strong data-cooldown-time="\${report.cooldownUntil}">...</strong></span>
+           <span>Rate limited while fetching quota</span>
+           <span class="countdown-badge urgent" style="font-weight:600">cooldown: <strong data-cooldown-time="\${esc(report.cooldownUntil)}">...</strong></span>
         </div>\`;
       } else {
-        html += \`<div class="err-box">\${report.error}</div>\`;
+         html += \`<div class="err-box">\${esc(report.error)}</div>\`;
       }
     }
     
     html += \`</div>\`; // end top group
 
-    if (p.connected && report && report.dashboardUrl) {
+    const dashboardHref = report && safeHref(report.dashboardUrl);
+    if (p.connected && dashboardHref) {
       html += \`<div class="card-footer">
-        <a class="dash-link" href="\${report.dashboardUrl}" target="_blank" rel="noreferrer">
+         <a class="dash-link" href="\${dashboardHref}" target="_blank" rel="noreferrer">
           Official Dashboard ↗
         </a>
       </div>\`;
@@ -854,6 +871,14 @@ function render() {
 
   // Local vLLM Card
   const vllmReport = state.reports.find(r => r.provider === 'local-vllm');
+  const providerCount = state.providers.length;
+  const localCount = vllmReport ? 1 : 0;
+  document.getElementById('kpiProviders').textContent = providerCount + ' cloud + ' + localCount + ' local';
+  if (vllmReport && vllmReport.extraStats && vllmReport.extraStats.vramTotalGb) {
+    document.getElementById('kpiLocalVllm').textContent = String(vllmReport.extraStats.vramTotalGb) + ' GB';
+  } else {
+    document.getElementById('kpiLocalVllm').textContent = vllmReport ? 'configured' : 'none';
+  }
   if (vllmReport && !state.providers.some(p => p.id === 'local-vllm')) {
     html += \`<div class="provider-card local-vllm">
       <div>
@@ -861,12 +886,12 @@ function render() {
           <div class="provider-meta">
             <div class="logo-box local-vllm">\${LOGOS['local-vllm']}</div>
             <div class="provider-title">
-              <span class="provider-name">\${vllmReport.label}</span>
-              <span class="provider-email">\${vllmReport.email}</span>
+               <span class="provider-name">\${esc(vllmReport.label)}</span>
+               <span class="provider-email">\${esc(vllmReport.email)}</span>
             </div>
           </div>
           <div class="badge-group">
-            <span class="pill">\${vllmReport.plan}</span>
+             <span class="pill">\${esc(vllmReport.plan)}</span>
             <span class="pill peak"><span class="pill-dot" style="background:var(--nvidia)"></span>Local</span>
           </div>
         </div>\`;
@@ -879,11 +904,11 @@ function render() {
             const barGradient = isVram ? 'linear-gradient(90deg, #76b900, #84cc16)' : 'linear-gradient(90deg, #0284c7, #10b981)';
             const statColor = isVram ? 'var(--nvidia)' : '#38bdf8';
             html += \`<div class="quota-row">
-              <span class="quota-name">\${l.label}</span>
+               <span class="quota-name">\${esc(l.label)}</span>
               <div class="quota-track">
-                <div class="quota-fill" style="width:\${pct}%;background:\${barGradient}"></div>
+                 <div class="quota-fill" style="width:\${esc(pct)}%;background:\${barGradient}"></div>
               </div>
-              <div class="quota-stat"><span class="quota-pct" style="color:\${statColor}">\${pct.toFixed(1)}%</span></div>
+               <div class="quota-stat"><span class="quota-pct" style="color:\${statColor}">\${esc(pct.toFixed(1))}%</span></div>
             </div>\`;
           }
           html += \`</div>\`;
@@ -891,17 +916,18 @@ function render() {
 
         if (vllmReport.extraStats) {
           html += \`<div class="extra-stats-bar">
-            <div class="mini-stat"><span class="mini-stat-label">Active</span><span class="mini-stat-val" style="color:#38bdf8">\${vllmReport.extraStats.runningReqs || 0} reqs</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Queue</span><span class="mini-stat-val">\${vllmReport.extraStats.waitingReqs || 0}</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10b981">\${vllmReport.extraStats.cacheHitRate}</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">\${(vllmReport.extraStats.tokensGenerated || 0).toLocaleString()}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Active</span><span class="mini-stat-val" style="color:#38bdf8">\${esc(vllmReport.extraStats.runningReqs || 0)} reqs</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Queue</span><span class="mini-stat-val">\${esc(vllmReport.extraStats.waitingReqs || 0)}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10a37f">\${esc(vllmReport.extraStats.cacheHitRate)}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">\${esc((vllmReport.extraStats.tokensGenerated || 0).toLocaleString())}</span></div>
           </div>\`;
         }
         if (vllmReport.error) {
-          html += \`<div class="err-box">\${vllmReport.error}</div>\`;
+           html += \`<div class="err-box">\${esc(vllmReport.error)}</div>\`;
         }
-        if (vllmReport.dashboardUrl) {
-          html += \`<div class="card-footer"><a class="dash-link" href="\${vllmReport.dashboardUrl}" target="_blank" rel="noreferrer">vLLM API ↗</a></div>\`;
+        const vllmHref = safeHref(vllmReport.dashboardUrl);
+        if (vllmHref) {
+           html += \`<div class="card-footer"><a class="dash-link" href="\${vllmHref}" target="_blank" rel="noreferrer">vLLM API ↗</a></div>\`;
         }
       html += \`</div></div>\`;
   }
@@ -956,7 +982,8 @@ function render() {
         if (kumaReport.error) {
           html += \`<div class="err-box">\${esc(kumaReport.error)}</div>\`;
         }
-        html += \`<div class="card-footer"><a class="dash-link" href="\${esc(kumaReport.dashboardUrl)}" target="_blank" rel="noreferrer">Uptime Kuma ↗</a></div>\`;
+        const kumaHref = safeHref(kumaReport.dashboardUrl);
+        if (kumaHref) html += \`<div class="card-footer"><a class="dash-link" href="\${kumaHref}" target="_blank" rel="noreferrer">Uptime Kuma ↗</a></div>\`;
       html += \`</div></div>\`;
   }
 
@@ -1000,13 +1027,15 @@ function render() {
           </div>\`;
         }
         html += \`</div>
-        <div class="card-footer"><a class="dash-link" href="\${esc(agentsReport.dashboardUrl)}" target="_blank" rel="noreferrer">Repository & Workflows ↗</a></div>
+         <div class="card-footer"><a class="dash-link" href="\${safeHref(agentsReport.dashboardUrl)}" target="_blank" rel="noreferrer">Repository & Workflows ↗</a></div>
       </div></div>\`;
   }
 
   document.getElementById('cardsContainer').innerHTML = html;
   
-  if (saturatedCount > 0) {
+  if (errorCount > 0) {
+    document.getElementById('kpiHealth').innerHTML = '<span style="color:var(--warn)">●</span> ' + errorCount + ' error' + (errorCount > 1 ? 's' : '');
+  } else if (saturatedCount > 0) {
     document.getElementById('kpiHealth').innerHTML = \`<span style="color:var(--bad)">●</span> \${saturatedCount} Quota\${saturatedCount>1?'s':''} Saturated\`;
   } else {
     document.getElementById('kpiHealth').innerHTML = \`<span style="color:var(--ok)">●</span> 100% OK\`;
@@ -1016,7 +1045,7 @@ function render() {
 }
 
 async function login(id) {
-  const res = await fetch('/api/login/' + id, { method: 'POST' });
+  const res = await fetch('/api/login/' + id, { method: 'POST', headers: { 'x-requested-with': 'triroute-dashboard' } });
   const data = await res.json();
   if (data.error) { alert(data.error); return; }
   window.open(data.url, '_blank');
@@ -1036,7 +1065,7 @@ async function submitCode(id) {
   const input = document.getElementById('code-' + id);
   const res = await fetch('/api/login/' + id + '/code', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-requested-with': 'triroute-dashboard' },
     body: JSON.stringify({ code: input.value })
   });
   const data = await res.json();
@@ -1046,7 +1075,7 @@ async function submitCode(id) {
 
 async function logout(id) {
   if (!confirm('Remove credentials for this provider?')) return;
-  await fetch('/api/logout/' + id, { method: 'POST' });
+  await fetch('/api/logout/' + id, { method: 'POST', headers: { 'x-requested-with': 'triroute-dashboard' } });
   refresh();
 }
 

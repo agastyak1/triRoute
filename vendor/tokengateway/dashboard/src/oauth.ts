@@ -138,7 +138,7 @@ export async function beginLogin(providerId: ProviderId): Promise<{ url: string;
 		try {
 			const result = await callback;
 			if ("error" in result) throw new Error(result.error);
-			if (result.state && result.state !== state) throw new Error("state mismatch (possible CSRF)");
+			if (result.state !== state) throw new Error("state missing or mismatched (possible CSRF)");
 			await exchangeCode(config, result.code, verifier, redirectUri, state);
 		} finally {
 			cancelLogin(providerId);
@@ -167,13 +167,14 @@ export async function completeLoginWithCode(providerId: ProviderId, pastedCode: 
 	// claude.ai renders the code as `<code>#<state>`.
 	const [code, fragmentState] = pastedCode.trim().split("#");
 	if (!code) throw new Error("Empty code");
+	if (!fragmentState) throw new Error("Callback state is required");
 	try {
 		await exchangeCode(
 			PROVIDERS[providerId],
 			code,
 			entry.verifier,
 			entry.redirectUri,
-			fragmentState || entry.state,
+			fragmentState,
 		);
 	} finally {
 		cancelLogin(providerId);
@@ -293,6 +294,23 @@ async function exchangeCode(
 
 /** Refresh an expired access token, persisting whatever the provider rotates. */
 export async function refreshCredential(
+	providerId: ProviderId,
+	credential: StoredCredential,
+): Promise<StoredCredential> {
+	const inFlight = refreshInFlight.get(providerId);
+	if (inFlight) return await inFlight;
+	const refreshPromise = refreshCredentialOnce(providerId, credential);
+	refreshInFlight.set(providerId, refreshPromise);
+	try {
+		return await refreshPromise;
+	} finally {
+		if (refreshInFlight.get(providerId) === refreshPromise) refreshInFlight.delete(providerId);
+	}
+}
+
+const refreshInFlight: Map<ProviderId, Promise<StoredCredential>> = new Map();
+
+async function refreshCredentialOnce(
 	providerId: ProviderId,
 	credential: StoredCredential,
 ): Promise<StoredCredential> {

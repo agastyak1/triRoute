@@ -5,7 +5,7 @@
  * long-lived, so the file is the app's most sensitive artifact.
  */
 
-import { chmod } from "node:fs/promises";
+import { chmod, mkdir, rename, rm, stat, unlink } from "node:fs/promises";
 import { isRecord, readNumber, readString } from "./guards";
 import { type ProviderId, isProviderId } from "./providers";
 
@@ -93,7 +93,10 @@ export async function loadCredentials(): Promise<CredentialMap> {
 	if (await file.exists()) {
 		try {
 			const parsed: unknown = await file.json();
-			if (isRecord(parsed)) {
+			if (!isRecord(parsed)) {
+				storeUnreadable = true;
+				console.warn(`[store] STORE_PATH is not a JSON object; writes blocked to prevent token loss`);
+			} else {
 				storeUnreadable = false;
 				for (const [provider, value] of Object.entries(parsed)) {
 					if (!isProviderId(provider) || !isRecord(value)) continue;
@@ -111,8 +114,11 @@ export async function loadCredentials(): Promise<CredentialMap> {
 				}
 			}
 		} catch (error) {
+			storeUnreadable = true;
 			console.warn(`[store] STORE_PATH unreadable: ${error}`);
 		}
+	} else {
+		storeUnreadable = false;
 	}
 
 	return applyOverlay(credentials);
@@ -132,6 +138,22 @@ async function syncToKubernetesSecrets(credentials: CredentialMap): Promise<void
 		const host = process.env.KUBERNETES_SERVICE_HOST || "kubernetes.default.svc";
 		const port = process.env.KUBERNETES_SERVICE_PORT || "443";
 		const k8sBase = `https://${host}:${port}`;
+		const caFile = Bun.file(caPath);
+		const tls = (await caFile.exists()) ? { ca: caFile } : undefined;
+		const failures: string[] = [];
+		const patchSecret = async (url: string, body: string): Promise<void> => {
+			const response = await fetch(url, {
+				method: "PATCH",
+				headers: {
+					Authorization: `Bearer ${saToken}`,
+					"Content-Type": "application/strategic-merge-patch+json",
+				},
+				body,
+				signal: AbortSignal.timeout(10_000),
+				...(tls ? { tls } : {}),
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		};
 
 		// 1. Sync Secret quota-dashboard-credentials in current namespace
 		const qCredsJson = JSON.stringify(credentials, null, 2);
@@ -142,18 +164,22 @@ async function syncToKubernetesSecrets(credentials: CredentialMap): Promise<void
 			},
 		});
 
-		await fetch(`${k8sBase}/api/v1/namespaces/${ns}/secrets/quota-dashboard-credentials`, {
-			method: "PATCH",
-			headers: {
-				Authorization: `Bearer ${saToken}`,
-				"Content-Type": "application/strategic-merge-patch+json",
-			},
-			body: patchQuotaBody,
-			tls: { ca: Bun.file(caPath) },
-		}).catch(err => console.warn(`[store] Failed to update secret quota-dashboard-credentials: ${err}`));
+		try {
+			await patchSecret(`${k8sBase}/api/v1/namespaces/${ns}/secrets/quota-dashboard-credentials`, patchQuotaBody);
+		} catch (error) {
+			failures.push(`quota-dashboard-credentials: ${error}`);
+		}
 
 		// 2. Sync Secret litellm-secrets in litellm namespace
-		const litellmData: Record<string, string> = {};
+		const litellmData: Record<string, string | null> = {
+			OPENAI_CODEX_OAUTH_TOKEN: null,
+			OPENAI_CODEX_REFRESH_TOKEN: null,
+			ANTHROPIC_OAUTH_TOKEN: null,
+			ANTHROPIC_REFRESH_TOKEN: null,
+			GOOGLE_ANTIGRAVITY_OAUTH_TOKEN: null,
+			GOOGLE_ANTIGRAVITY_REFRESH_TOKEN: null,
+			GOOGLE_ANTIGRAVITY_PROJECT_ID: null,
+		};
 		if (credentials["openai-codex"]?.access) {
 			litellmData["OPENAI_CODEX_OAUTH_TOKEN"] = Buffer.from(credentials["openai-codex"].access).toString("base64");
 		}
@@ -176,19 +202,19 @@ async function syncToKubernetesSecrets(credentials: CredentialMap): Promise<void
 			litellmData["GOOGLE_ANTIGRAVITY_PROJECT_ID"] = Buffer.from(credentials["google-antigravity"].projectId).toString("base64");
 		}
 
-		if (Object.keys(litellmData).length > 0) {
-			const patchLitellmBody = JSON.stringify({ data: litellmData });
-			await fetch(`${k8sBase}/api/v1/namespaces/litellm/secrets/litellm-secrets`, {
-				method: "PATCH",
-				headers: {
-					Authorization: `Bearer ${saToken}`,
-					"Content-Type": "application/strategic-merge-patch+json",
-				},
-				body: patchLitellmBody,
-				tls: { ca: Bun.file(caPath) },
-		}).catch(err => console.warn(`[store] Failed to update secret litellm-secrets: ${err}`));
+		try {
+			await patchSecret(
+				`${k8sBase}/api/v1/namespaces/litellm/secrets/litellm-secrets`,
+				JSON.stringify({ data: litellmData }),
+			);
+		} catch (error) {
+			failures.push(`litellm-secrets: ${error}`);
 		}
-		console.log(`[store] Kubernetes Secrets synchronized successfully`);
+		if (failures.length > 0) {
+			console.warn(`[store] Kubernetes Secret sync incomplete: ${failures.join("; ")}`);
+		} else {
+			console.log(`[store] Kubernetes Secrets synchronized successfully`);
+		}
 	} catch (e) {
 		console.warn(`[store] Error syncing Kubernetes Secrets: ${e}`);
 	}
@@ -201,26 +227,68 @@ async function syncToKubernetesSecrets(credentials: CredentialMap): Promise<void
  * a full re-login. The queue makes each mutation observe the previous write.
  */
 let writeQueue: Promise<void> = Promise.resolve();
+const LOCK_TIMEOUT_MS = 30_000;
+const LOCK_STALE_MS = 10 * 60_000;
+
+async function withStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+	const lockPath = `${STORE_PATH}.lockdir`;
+	const deadline = Date.now() + LOCK_TIMEOUT_MS;
+	while (true) {
+		try {
+			await mkdir(lockPath, { mode: 0o700 });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				const details = await stat(lockPath);
+				if (Date.now() - details.mtimeMs > LOCK_STALE_MS) {
+					await rm(lockPath, { recursive: true, force: true });
+					continue;
+				}
+			} catch {
+				continue;
+			}
+			if (Date.now() >= deadline) throw new Error("timed out waiting for the credentials writer lock");
+			await Bun.sleep(50);
+		}
+	}
+	try {
+		return await operation();
+	} finally {
+		await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+	}
+}
 
 function mutate(apply: (credentials: CredentialMap) => void): Promise<void> {
 	const next = writeQueue.then(async () => {
-		const credentials = await loadCredentials();
-		apply(credentials);
-		if (storeUnreadable) {
-			persistFailure = "credentials file unreadable — write blocked to prevent token loss";
-			console.warn(`[store] ${persistFailure}`);
-			return;
-		}
-		try {
-			await Bun.write(STORE_PATH, JSON.stringify(credentials, null, 2));
-			await chmod(STORE_PATH, 0o600);
-			persistFailure = undefined;
-		} catch (error) {
-			// Read-only mount (K8s Secret): the overlay already holds the value, so
-			// the refresh still counts. Losing the write must not fail it.
-			persistFailure = error instanceof Error ? error.message : String(error);
-			console.warn(`[store] persistence failed (using in-memory overlay): ${persistFailure}`);
-		}
+		const credentials = await withStoreLock(async () => {
+			const loaded = await loadCredentials();
+			apply(loaded);
+			if (storeUnreadable) {
+				persistFailure = "credentials file unreadable — write blocked to prevent token loss";
+				console.warn(`[store] ${persistFailure}`);
+				return undefined;
+			}
+			try {
+				const tmpPath = `${STORE_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+				try {
+					await Bun.write(tmpPath, `${JSON.stringify(loaded, null, 2)}\n`);
+					await chmod(tmpPath, 0o600);
+					await rename(tmpPath, STORE_PATH);
+					await chmod(STORE_PATH, 0o600);
+				} finally {
+					await unlink(tmpPath).catch(() => {});
+				}
+				persistFailure = undefined;
+			} catch (error) {
+				// Read-only mount (K8s Secret): the overlay already holds the value, so
+				// the refresh still counts. Losing the write must not fail it.
+				persistFailure = error instanceof Error ? error.message : String(error);
+				console.warn(`[store] persistence failed (using in-memory overlay): ${persistFailure}`);
+			}
+			return loaded;
+		});
+		if (!credentials) return;
 		await syncToKubernetesSecrets(credentials);
 	});
 	// Keep the chain alive after a rejection so one failure cannot wedge the queue.
@@ -229,15 +297,22 @@ function mutate(apply: (credentials: CredentialMap) => void): Promise<void> {
 }
 
 export function saveCredential(provider: ProviderId, credential: StoredCredential): Promise<void> {
-	overlay.set(provider, credential);
 	return mutate(credentials => {
-		credentials[provider] = credential;
+		const previous = credentials[provider];
+		const merged: StoredCredential = {
+			...previous,
+			...credential,
+			refresh: credential.refresh ?? previous?.refresh,
+			projectId: credential.projectId ?? previous?.projectId,
+		};
+		overlay.set(provider, merged);
+		credentials[provider] = merged;
 	});
 }
 
 export function deleteCredential(provider: ProviderId): Promise<void> {
-	overlay.set(provider, null);
 	return mutate(credentials => {
+		overlay.set(provider, null);
 		delete credentials[provider];
 	});
 }

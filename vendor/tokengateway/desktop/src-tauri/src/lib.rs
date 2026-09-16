@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use serde_json::Value;
 use tauri::{command, AppHandle, State, WebviewUrl, WebviewWindowBuilder};
+use url::Url;
 
 pub mod oauth;
 use oauth::*;
@@ -29,8 +30,18 @@ pub fn open_browser(url: &str) -> Result<(), String> {
 
 #[command]
 async fn start_login(provider: String, state: State<'_, Arc<OAuthState>>) -> Result<String, String> {
+    if !matches!(
+        provider.as_str(),
+        "anthropic" | "openai-codex" | "google-antigravity"
+    ) {
+        return Err(format!("Unknown provider: {}", provider));
+    }
     let (verifier, challenge) = generate_pkce();
     let state_uuid = uuid_v4_simple();
+    {
+        let mut states = state.states.lock().await;
+        states.insert(provider.clone(), state_uuid.clone());
+    }
 
     let auth_url = match provider.as_str() {
         "anthropic" => {
@@ -91,6 +102,7 @@ fn uuid_v4_simple() -> String {
 
 #[command]
 fn open_url(url: String) -> Result<(), String> {
+    validate_http_url(&url)?;
     open_browser(&url)
 }
 
@@ -101,26 +113,18 @@ async fn paste_redirect(
     state: State<'_, Arc<OAuthState>>,
     app: AppHandle,
 ) -> Result<OAuthCredential, String> {
-    let code = if url_or_code.contains("code=") {
-        url_or_code
-            .split("code=")
-            .nth(1)
-            .and_then(|s| s.split('&').next())
-            .unwrap_or(&url_or_code)
+    let (code, state_param) = if let Ok(url) = Url::parse(&url_or_code) {
+        let code = url.query_pairs().find(|(key, _)| key == "code").map(|(_, value)| value.into_owned());
+        let callback_state = url.query_pairs().find(|(key, _)| key == "state").map(|(_, value)| value.into_owned());
+        (code.unwrap_or_default(), callback_state)
     } else {
-        &url_or_code
+        let (code, fragment_state) = url_or_code.split_once('#').unwrap_or((&url_or_code, ""));
+        (code.to_string(), (!fragment_state.is_empty()).then(|| fragment_state.to_string()))
     };
-
-    let state_param = if url_or_code.contains("state=") {
-        url_or_code
-            .split("state=")
-            .nth(1)
-            .and_then(|s| s.split('&').next())
-    } else {
-        None
-    };
-
-    handle_token_exchange(&provider, code, state_param, &state, &app).await
+    if code.is_empty() {
+        return Err("Authorization code is missing".to_string());
+    }
+    handle_token_exchange(&provider, &code, state_param.as_deref(), &state, &app).await
 }
 
 #[command]
@@ -167,12 +171,12 @@ async fn get_cluster_usage(
     state: State<'_, Arc<OAuthState>>,
 ) -> Result<Value, String> {
     let url = cluster_url.unwrap_or_else(|| CLUSTER_USAGE_URL.to_string());
-    let resp = state
-        .http_client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to contact cluster: {}", e))?;
+    validate_http_url(&url)?;
+    let mut request = state.http_client.get(&url);
+    if let Some(key) = state.dashboard_api_key.clone() {
+        request = request.bearer_auth(key);
+    }
+    let resp = request.send().await.map_err(|e| format!("Failed to contact cluster: {}", e))?;
 
     if resp.status().is_success() {
         let val: Value = resp.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -187,27 +191,37 @@ async fn sync_to_cluster(
     cluster_url: Option<String>,
     state: State<'_, Arc<OAuthState>>,
 ) -> Result<String, String> {
-    let creds = state.credentials.lock().await;
+    let creds = state.credentials.lock().await.clone();
     if creds.is_empty() {
         return Err("No local credentials to sync.".to_string());
     }
 
     let url = cluster_url.unwrap_or_else(|| CLUSTER_CREDENTIALS_URL.to_string());
-    let payload = serde_json::to_value(&*creds).map_err(|e| e.to_string())?;
+    validate_http_url(&url)?;
+    let payload = serde_json::to_value(&creds).map_err(|e| e.to_string())?;
 
-    let res = state
-        .http_client
-        .post(&url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to contact cluster: {}", e))?;
+    let mut request = state.http_client.post(&url).json(&payload);
+    if let Some(key) = state.dashboard_api_key.clone() {
+        request = request.bearer_auth(key);
+    }
+    let res = request.send().await.map_err(|e| format!("Failed to contact cluster: {}", e))?;
 
     if res.status().is_success() {
         Ok(format!("Successfully synced {} credentials with the cluster!", creds.len()))
     } else {
         Err(format!("Cluster responded with HTTP status {}", res.status()))
     }
+}
+
+fn validate_http_url(raw: &str) -> Result<(), String> {
+    let url = Url::parse(raw).map_err(|_| "Invalid URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Only http:// and https:// URLs are allowed".to_string());
+    }
+    if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
+        return Err("URL must not contain credentials or a fragment".to_string());
+    }
+    Ok(())
 }
 
 pub fn run() {

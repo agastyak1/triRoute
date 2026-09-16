@@ -172,21 +172,21 @@ This project is a personal homelab tool, not production hardened. The following 
 
 | ID | Severity | Component | Issue |
 |---|---|---|---|
-| TG-001 | 🔴 Critical | `dashboard/server.ts` | `GET /api/credentials` and `POST /api/credentials` have **no authentication**. Any process on the same host or Docker network can read or overwrite all OAuth tokens. |
-| TG-002 | 🔴 Critical | `desktop/src-tauri/src/oauth.rs` | TLS certificate validation is **disabled** (`danger_accept_invalid_certs(true)`) in the Rust HTTP client used to sync credentials to the cluster. Susceptible to MITM on LAN. |
+| TG-001 | 🔴 Critical → ✅ Fixed | `dashboard/server.ts` | Dashboard API routes now require `DASHBOARD_API_KEY` via a Bearer header or same-origin HttpOnly session cookie; mutating browser requests also require the dashboard header. |
+| TG-002 | 🔴 Critical → ✅ Fixed | `desktop/src-tauri/src/oauth.rs` | TLS certificate validation is enabled and the desktop HTTP client has a bounded timeout. |
 | TG-003 | 🔴 Critical | `litellm-plugin/sitecustomize.py` | The plugin reads the pod's Kubernetes Service Account token at runtime and uses it to PATCH `secrets/litellm-secrets` on every token refresh. Any RCE in the LiteLLM process grants K8s secret-write capability. |
-| TG-004 | 🟠 High | `docker-compose.yml` | `LITELLM_MASTER_KEY` falls back to a hardcoded default (`sk-quota-gateway-master-key`) if the env var is unset. |
+| TG-004 | 🟠 High → ✅ Fixed | `docker-compose.yml` | Compose now refuses to start when `LITELLM_MASTER_KEY` is unset instead of using a hardcoded default. |
 | TG-005 | 🟠 High | `dashboard/src/store.ts` + `deploy/kubernetes/rbac.yaml` | The dashboard attempts to PATCH a secret in the `litellm` namespace but the declared RBAC `Role` is scoped to `quota-dashboard` only. Either silently fails or implies undeclared cluster permissions. |
 | TG-006 | 🟡 Medium | `dashboard/src/oauth.ts` | OIDC `id_token` is decoded without signature verification — identity claims accepted on trust. |
-| TG-007 | 🟡 Medium | `dashboard/src/oauth.ts` | OAuth callback listener binds `0.0.0.0` during login — ephemeral port open to all interfaces for up to 15 minutes. |
+| TG-007 | 🟡 Medium → ✅ Fixed | `dashboard/src/oauth.ts` | OAuth callback listeners bind only `127.0.0.1` and `::1`. |
 | TG-008 | 🟡 Medium | `docker-compose.yml` | `credentials.json` is `chmod 0600` but the Docker volume is shared with the LiteLLM container, which can read it if running as root or the same UID. |
-| TG-009 | 🟡 Medium | `desktop/src-tauri/src/lib.rs` | Tauri `open_url` command passes arbitrary URLs to the OS browser opener without validating the scheme (`file://`, `javascript:` accepted). |
+| TG-009 | 🟡 Medium → ✅ Fixed | `desktop/src-tauri/src/lib.rs` | Desktop URL commands now allow only credential-free `http`/`https` URLs. |
 | TG-010 | 🟡 Medium | `litellm-plugin/sitecustomize.py` | Refreshed OAuth tokens are written back to `os.environ`, exposing them via `/proc/self/environ` to co-tenant processes. |
-| TG-011 | 🔵 Low | `desktop/src-tauri/src/oauth.rs` | Google OAuth token exchange does not validate the `state` parameter (CSRF). Anthropic and OpenAI exchanges do. |
+| TG-011 | 🔵 Low → ✅ Fixed | `desktop/src-tauri/src/oauth.rs`, `dashboard/src/oauth.ts` | OAuth state is stored per provider and required on callback/code exchange for all providers, including Google. |
 | TG-012 | 🟠 High → ✅ Fixed | `litellm-plugin/sitecustomize.py` | `GOOGLE_CLIENT_SECRET` was hardcoded in source and present throughout git history. Now read from the `GOOGLE_CLIENT_SECRET` env var (empty default), and the value was purged from history. Rotation is not applicable here: the value is Google Antigravity's own first-party client secret, already public in the shipped client, not a credential owned by this project. A deployment that substitutes its own OAuth client must keep that secret out of the repo. |
 | TG-013 | 🟡 Medium | `desktop/src-tauri/Cargo.lock` | `glib` 0.18.5 (transitive via Tauri 2's gtk-rs 0.18 stack) is affected by GHSA-wrw7-89jp-8q8g (unsoundness in `VariantStrIter` iterators). No isolated fix: the patched 0.20.0 requires migrating the whole gtk-rs line, which stable Tauri 2 does not yet support. The unsound path is not exercised by this app; accepted as tolerable risk until Tauri bumps its GTK bindings. |
 | TG-014 | 🔵 Low → ✅ Fixed | `dashboard/src/usage.ts`, `dashboard/src/ui.ts`, `desktop/src/index.html` | The agent roster and cluster counters were hardcoded to the author's homelab (node/VM counts, VM id, Proxmox role name, internal tooling). Now driven by `A2A_AGENT_ROSTER`, `CLUSTER_NODE_COUNT` and `CLUSTER_VM_COUNT`; counters are omitted from the card when unset. |
-| TG-015 | 🟠 High → ✅ Fixed | `dashboard/src/usage.ts` | When the Anthropic usage fetch failed **and** no cached snapshot existed, the report returned hardcoded limits (`5h=2%`, `7d=51%`) flagged `cached: true` with no `error`, so an unreachable provider rendered as healthy — a false negative that misdirects exactly the quota diagnosis the dashboard exists for. Removed: the legitimate fallback is the snapshot cache alongside it, which holds values the provider actually returned. With no snapshot the error path now handles it. |
+| TG-015 | 🟠 High → ✅ Fixed | `dashboard/src/usage.ts`, `dashboard/src/ui.ts` | Failed usage requests now remain errors, and the dashboard KPI reports provider errors instead of rendering a false “100% OK”. |
 
 **TG-001 is the most immediately exploitable** — no prerequisites, single HTTP request. If you deploy this outside a trusted single-machine environment, add at minimum a shared-secret header check on all `/api/*` routes and bind the dashboard to `127.0.0.1`.
 

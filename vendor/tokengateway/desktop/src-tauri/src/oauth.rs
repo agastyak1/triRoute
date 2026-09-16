@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
@@ -33,7 +33,7 @@ pub const OPENAI_SCOPES: &str = "openid profile email offline_access api.connect
 pub const GOOGLE_PORT: u16 = 51121;
 pub const GOOGLE_CALLBACK_PATH: &str = "/oauth-callback";
 pub const GOOGLE_CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-pub const GOOGLE_CLIENT_SECRET: &str = env!("GOOGLE_CLIENT_SECRET");
+pub const GOOGLE_CLIENT_SECRET: &str = "";
 pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
@@ -65,19 +65,23 @@ pub struct ProviderStatus {
 
 pub struct OAuthState {
     pub verifiers: Mutex<HashMap<String, String>>,
+    pub states: Mutex<HashMap<String, String>>,
     pub credentials: Mutex<HashMap<String, OAuthCredential>>,
     pub http_client: Client,
+    pub dashboard_api_key: Option<String>,
 }
 
 impl OAuthState {
     pub fn new() -> Self {
         Self {
             verifiers: Mutex::new(HashMap::new()),
+            states: Mutex::new(HashMap::new()),
             credentials: Mutex::new(HashMap::new()),
             http_client: Client::builder()
-                .danger_accept_invalid_certs(true)
+                .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            dashboard_api_key: std::env::var("DASHBOARD_API_KEY").ok().filter(|v| !v.is_empty()),
         }
     }
 }
@@ -87,6 +91,15 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub fn generate_pkce() -> (String, String) {
@@ -188,6 +201,7 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
                     }
 
                     let html_body = if success {
+                        let display_email = html_escape(user_email.as_deref().unwrap_or(""));
                         format!(r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -210,8 +224,9 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
   </div>
   <script>setTimeout(() => window.close(), 2500);</script>
 </body>
-</html>"#, user_email.unwrap_or_default())
+</html>"#, display_email)
                     } else {
+                        let display_error = html_escape(&error_msg);
                         format!(r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -233,7 +248,7 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
     <p>Copy the URL from the address bar and paste it into the manual field in Quota Desktop.</p>
   </div>
 </body>
-</html>"#, error_msg)
+</html>"#, display_error)
                     };
 
                     let resp_header = format!(
@@ -284,10 +299,22 @@ pub async fn handle_token_exchange(
     state: &OAuthState,
     _app: &AppHandle,
 ) -> Result<OAuthCredential, String> {
+    let expected_state = {
+        let mut states = state.states.lock().await;
+        states.remove(provider_id)
+    }
+    .ok_or_else(|| "No pending OAuth state for this provider".to_string())?;
+    if state_param != Some(expected_state.as_str()) {
+        return Err("OAuth state missing or mismatched (possible CSRF)".to_string());
+    }
+
     let verifier = {
         let verifiers = state.verifiers.lock().await;
         verifiers.get(provider_id).cloned().unwrap_or_default()
     };
+    if matches!(provider_id, "anthropic" | "openai-codex") && verifier.is_empty() {
+        return Err("No PKCE verifier for this OAuth flow".to_string());
+    }
 
     let cred = match provider_id {
         "anthropic" => exchange_anthropic(code, state_param, &verifier, &state.http_client).await?,
@@ -303,16 +330,17 @@ pub async fn handle_token_exchange(
 
     // Auto-sync with Quota Dashboard in background
     let client = state.http_client.clone();
+    let dashboard_api_key = state.dashboard_api_key.clone();
     let creds_map = {
         let creds = state.credentials.lock().await;
         creds.clone()
     };
     tauri::async_runtime::spawn(async move {
-        let _ = client
-            .post(CLUSTER_CREDENTIALS_URL)
-            .json(&creds_map)
-            .send()
-            .await;
+        let mut request = client.post(CLUSTER_CREDENTIALS_URL).json(&creds_map);
+        if let Some(key) = dashboard_api_key {
+            request = request.bearer_auth(key);
+        }
+        let _ = request.send().await;
     });
 
     Ok(cred)
@@ -447,10 +475,12 @@ async fn exchange_google(code: &str, client: &Client) -> Result<OAuthCredential,
     }
 
     let redirect = format!("http://localhost:{}{}", GOOGLE_PORT, GOOGLE_CALLBACK_PATH);
+    let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET")
+        .unwrap_or_else(|_| GOOGLE_CLIENT_SECRET.to_string());
     let params = [
         ("grant_type", "authorization_code"),
         ("client_id", GOOGLE_CLIENT_ID),
-        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("client_secret", google_client_secret.as_str()),
         ("code", clean_code.as_str()),
         ("redirect_uri", redirect.as_str()),
     ];

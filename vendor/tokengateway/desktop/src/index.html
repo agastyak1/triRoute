@@ -577,7 +577,7 @@
     </div>
     <div class="kpi-item">
       <span class="kpi-label">Local Hardware</span>
-      <span class="kpi-val" id="kpiHardware" style="color:var(--nvidia)">3× RTX 5060 Ti</span>
+      <span class="kpi-val" id="kpiHardware" style="color:var(--nvidia)">--</span>
     </div>
   </div>
 
@@ -608,6 +608,19 @@ const LOGOS = {
   "uptime-kuma": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4l2.5-7 3.5 14 3-9 2 2h5"/></svg>`,
   "ai-agents": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>`
 };
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.origin);
+    return /^https?:$/.test(url.protocol) ? url.href : '';
+  } catch (_) {
+    return '';
+  }
+}
 
 let state = { providers: [], reports: [] };
 
@@ -709,20 +722,20 @@ function render() {
     const email = (report && report.email) || p.email || 'Not connected';
     const plan = (report && report.plan) || p.plan || '';
 
-    html += `<div class="provider-card ${sp.id}">`;
+    html += `<div class="provider-card ${esc(sp.id)}">`;
     html += `<div>
       <div class="card-header">
         <div class="provider-meta">
-          <div class="logo-box ${sp.id}">${LOGOS[sp.id] || ''}</div>
+           <div class="logo-box ${esc(sp.id)}">${LOGOS[sp.id] || ''}</div>
           <div class="provider-title">
-            <span class="provider-name">${sp.label}</span>
-            <span class="provider-email">${email}</span>
+             <span class="provider-name">${esc(sp.label)}</span>
+             <span class="provider-email">${esc(email)}</span>
           </div>
         </div>
         
         <div class="badge-group">`;
         
-        if (plan) html += `<span class="pill">${plan}</span>`;
+        if (plan) html += `<span class="pill">${esc(plan)}</span>`;
         
         if (report && report.limits && report.limits.length) {
           const worst = Math.max(...report.limits.map(l => l.usedFraction || 0));
@@ -733,7 +746,7 @@ function render() {
           }
           html += `<span class="pill peak">
             <span class="pill-dot" style="background:${getStatusColor(worst)}"></span>
-            ${worstPct}%
+             ${esc(worstPct)}%
           </span>`;
         }
         
@@ -747,13 +760,13 @@ function render() {
       for (const l of report.limits) {
         const pct = Math.min(100, Math.max(0, (l.usedFraction || 0) * 100));
         html += `<div class="quota-row">
-          <span class="quota-name">${l.label}</span>
+           <span class="quota-name">${esc(l.label)}</span>
           <div class="quota-track">
-            <div class="quota-fill" style="width:${pct}%;background:${getGradient(l.usedFraction || 0)}"></div>
+             <div class="quota-fill" style="width:${esc(pct)}%;background:${getGradient(l.usedFraction || 0)}"></div>
           </div>
           <div class="quota-stat">
-            <span class="quota-pct" style="color:${getStatusColor(l.usedFraction || 0)}">${pct.toFixed(1)}%</span>
-            ${l.resetsAt ? `<span class="countdown-badge" data-reset-time="${l.resetsAt}">reset ...</span>` : ''}
+             <span class="quota-pct" style="color:${getStatusColor(l.usedFraction || 0)}">${esc(pct.toFixed(1))}%</span>
+             ${l.resetsAt ? `<span class="countdown-badge" data-reset-time="${esc(l.resetsAt)}">reset ...</span>` : ''}
           </div>
         </div>`;
       }
@@ -767,7 +780,7 @@ function render() {
           <span class="countdown-badge urgent">cooldown: <strong data-cooldown-time="${report.cooldownUntil}">...</strong></span>
         </div>`;
       } else {
-        html += `<div class="err-box">${report.error}</div>`;
+        html += `<div class="err-box">${esc(report.error)}</div>`;
       }
     }
 
@@ -781,9 +794,10 @@ function render() {
 
     html += `</div>`; // end top group
 
-    if (report && report.dashboardUrl) {
+    const dashboardUrl = safeHttpUrl(report && report.dashboardUrl);
+    if (dashboardUrl) {
       html += `<div class="card-footer">
-        <span class="dash-link" onclick="openUrl('${report.dashboardUrl}')">Official Dashboard ↗</span>
+        <span class="dash-link" data-dashboard-url="${esc(dashboardUrl)}" onclick="openUrl(this.dataset.dashboardUrl)">Official Dashboard ↗</span>
       </div>`;
     }
 
@@ -799,12 +813,12 @@ function render() {
           <div class="provider-meta">
             <div class="logo-box local-vllm">${LOGOS['local-vllm']}</div>
             <div class="provider-title">
-              <span class="provider-name">${vllmReport.label}</span>
-              <span class="provider-email">${vllmReport.email}</span>
+               <span class="provider-name">${esc(vllmReport.label)}</span>
+               <span class="provider-email">${esc(vllmReport.email)}</span>
             </div>
           </div>
           <div class="badge-group">
-            <span class="pill">${vllmReport.plan || 'qwen3.8-27b'}</span>
+             <span class="pill">${esc(vllmReport.plan || 'local')}</span>
             <span class="pill peak"><span class="pill-dot" style="background:var(--nvidia)"></span>Local</span>
           </div>
         </div>`;
@@ -817,11 +831,11 @@ function render() {
             const barGradient = isVram ? 'linear-gradient(90deg, #76b900, #84cc16)' : 'linear-gradient(90deg, #0284c7, #10b981)';
             const statColor = isVram ? 'var(--nvidia)' : '#38bdf8';
             html += `<div class="quota-row">
-              <span class="quota-name">${l.label}</span>
+               <span class="quota-name">${esc(l.label)}</span>
               <div class="quota-track">
-                <div class="quota-fill" style="width:${pct}%;background:${barGradient}"></div>
+                 <div class="quota-fill" style="width:${esc(pct)}%;background:${barGradient}"></div>
               </div>
-              <div class="quota-stat"><span class="quota-pct" style="color:${statColor}">${pct.toFixed(1)}%</span></div>
+               <div class="quota-stat"><span class="quota-pct" style="color:${statColor}">${esc(pct.toFixed(1))}%</span></div>
             </div>`;
           }
           html += `</div>`;
@@ -829,10 +843,10 @@ function render() {
 
         if (vllmReport.extraStats) {
           html += `<div class="extra-stats-bar">
-            <div class="mini-stat"><span class="mini-stat-label">Active</span><span class="mini-stat-val" style="color:#38bdf8">${vllmReport.extraStats.runningReqs || 0} reqs</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Queue</span><span class="mini-stat-val">${vllmReport.extraStats.waitingReqs || 0}</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10b981">${vllmReport.extraStats.cacheHitRate || '--'}</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">${(vllmReport.extraStats.tokensGenerated || 0).toLocaleString()}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Active</span><span class="mini-stat-val" style="color:#38bdf8">${esc(vllmReport.extraStats.runningReqs || 0)} reqs</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Queue</span><span class="mini-stat-val">${esc(vllmReport.extraStats.waitingReqs || 0)}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10b981">${esc(vllmReport.extraStats.cacheHitRate || '--')}</span></div>
+             <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">${esc((vllmReport.extraStats.tokensGenerated || 0).toLocaleString())}</span></div>
           </div>`;
         }
       html += `</div></div>`;
@@ -850,8 +864,8 @@ function render() {
           <div class="provider-meta">
             <div class="logo-box uptime-kuma">${LOGOS['uptime-kuma']}</div>
             <div class="provider-title">
-              <span class="provider-name">${kumaReport.label}</span>
-              <span class="provider-email">${kumaReport.email}</span>
+               <span class="provider-name">${esc(kumaReport.label)}</span>
+               <span class="provider-email">${esc(kumaReport.email)}</span>
             </div>
           </div>
           <div class="badge-group">
@@ -862,10 +876,10 @@ function render() {
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Monitors</span><span class="mini-stat-val">${stats.total || 34}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Up</span><span class="mini-stat-val" style="color:var(--ok)">${stats.up || 32}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Down</span><span class="mini-stat-val" style="color:var(--bad)">${stats.down || 2}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Pending</span><span class="mini-stat-val" style="color:var(--warn)">${stats.pending || 0}</span></div>
+           <div class="mini-stat"><span class="mini-stat-label">Monitors</span><span class="mini-stat-val">${esc(stats.total ?? 0)}</span></div>
+           <div class="mini-stat"><span class="mini-stat-label">Up</span><span class="mini-stat-val" style="color:var(--ok)">${esc(stats.up ?? 0)}</span></div>
+           <div class="mini-stat"><span class="mini-stat-label">Down</span><span class="mini-stat-val" style="color:var(--bad)">${esc(stats.down ?? 0)}</span></div>
+           <div class="mini-stat"><span class="mini-stat-label">Pending</span><span class="mini-stat-val" style="color:var(--warn)">${esc(stats.pending ?? 0)}</span></div>
         </div>`;
 
         if (downList.length) {
@@ -873,7 +887,7 @@ function render() {
           for (const m of downList) {
             html += `<div class="monitor-row">
               <div class="monitor-dot"></div>
-              <span class="monitor-name">${m.name}</span>
+               <span class="monitor-name">${esc(m.name)}</span>
             </div>`;
           }
           html += `</div>`;
@@ -892,22 +906,22 @@ function render() {
           <div class="provider-meta">
             <div class="logo-box ai-agents">${LOGOS['ai-agents']}</div>
             <div class="provider-title">
-              <span class="provider-name">${agentReport.label}</span>
-              <span class="provider-email">${agentReport.email}</span>
+               <span class="provider-name">${esc(agentReport.label)}</span>
+               <span class="provider-email">${esc(agentReport.email)}</span>
             </div>
           </div>
           <div class="badge-group">
             <span class="pill peak">
               <span class="pill-dot" style="background:var(--ok)"></span>
-              ${stats.agentsCount ?? list.length} active
+               ${esc(stats.agentsCount ?? list.length)} active
             </span>
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Agents</span><span class="mini-stat-val" style="color:#a855f7">${stats.agentsCount ?? list.length}</span></div>
-          ${stats.k3sNodes === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">K3s Nodes</span><span class="mini-stat-val">${stats.k3sNodes}</span></div>`}
-          ${stats.proxmoxVms === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">VMs</span><span class="mini-stat-val">${stats.proxmoxVms}</span></div>`}
-          <div class="mini-stat"><span class="mini-stat-label">Online</span><span class="mini-stat-val" style="color:var(--ok)">${stats.activeSandboxes ?? 0}</span></div>
+           <div class="mini-stat"><span class="mini-stat-label">Agents</span><span class="mini-stat-val" style="color:#a855f7">${esc(stats.agentsCount ?? list.length)}</span></div>
+           ${stats.k3sNodes === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">K3s Nodes</span><span class="mini-stat-val">${esc(stats.k3sNodes)}</span></div>`}
+           ${stats.proxmoxVms === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">VMs</span><span class="mini-stat-val">${esc(stats.proxmoxVms)}</span></div>`}
+           <div class="mini-stat"><span class="mini-stat-label">Online</span><span class="mini-stat-val" style="color:var(--ok)">${esc(stats.activeSandboxes ?? 0)}</span></div>
         </div>
       </div></div>`;
   }

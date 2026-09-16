@@ -75,7 +75,7 @@ omp_codex = namespace["_codex_request_body"](
     None,
     dict(omp_extra),
 )
-assert "max_output_tokens" not in omp_codex
+assert omp_codex["max_output_tokens"] == 8192
 assert "max_completion_tokens" not in omp_codex
 assert "max_tokens" not in omp_codex
 assert omp_codex["reasoning"]["effort"] == "high"

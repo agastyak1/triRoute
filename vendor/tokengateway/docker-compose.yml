@@ -11,6 +11,7 @@ services:
       - "${PORT:-3737}:3737"
     environment:
       - PORT=3737
+      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY:?set a random dashboard API key}
       - CREDENTIALS_PATH=/app/data/credentials.json
       - VLLM_METRICS_URL=${VLLM_METRICS_URL:-}
       - UPTIME_KUMA_URL=${UPTIME_KUMA_URL:-}
@@ -25,7 +26,7 @@ services:
       - "${LITELLM_PORT:-4000}:4000"
     environment:
       - PYTHONPATH=/app/patch
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-quota-gateway-master-key}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?set a random LiteLLM master key}
     volumes:
       - ./litellm-plugin/sitecustomize.py:/app/patch/sitecustomize.py:ro
       - ./deploy/docker/litellm-config.yaml:/app/config.yaml:ro

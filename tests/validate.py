@@ -10,6 +10,7 @@ Usage: python3 tests/validate.py [--provider claude|gpt|gemini] [--require]
 """
 
 import json
+import argparse
 import os
 import subprocess
 import sys
@@ -69,7 +70,7 @@ def basic_text(model):
         data = json.loads(resp.read().decode("utf-8"))
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     assert data.get("role") == "assistant", f"bad role: {data.get('role')}"
-    assert "TRIROUTE-OK" in text.upper() or text.strip(), f"empty/weird text: {text[:80]!r}"
+    assert "TRIROUTE-OK" in text.upper(), f"unexpected text: {text[:80]!r}"
     assert data.get("usage", {}).get("output_tokens", 0) > 0, "missing usage"
 
 
@@ -147,7 +148,9 @@ def provider_authenticated(name):
     creds = os.path.join(ROOT, "data", "credentials.json")
     try:
         with open(creds, encoding="utf-8") as fh:
-            return CREDENTIAL_KEY[name] in json.load(fh)
+            data = json.load(fh)
+            entry = data.get(CREDENTIAL_KEY[name], {}) if isinstance(data, dict) else {}
+            return isinstance(entry, dict) and bool(entry.get("access")) and bool(entry.get("refresh"))
     except (FileNotFoundError, json.JSONDecodeError):
         return False
 
@@ -173,6 +176,10 @@ def run_suite(name):
     try:
         tu = tool_call(model)
         record(f"{name}/tool", "PASS", model)
+    except Exception as err:
+        record(f"{name}/tool", "FAIL", str(err)[:200])
+        return
+    try:
         multi_turn_tool(model, tu)
         record(f"{name}/multi-turn", "PASS", model)
     except Exception as err:
@@ -181,10 +188,10 @@ def run_suite(name):
 
 def main():
     global KEY
-    only = None
-    if "--provider" in sys.argv:
-        only = sys.argv[sys.argv.index("--provider") + 1]
-    require = "--require" in sys.argv
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider", choices=tuple(PROVIDER_MODELS))
+    parser.add_argument("--require", action="store_true")
+    args = parser.parse_args()
 
     try:
         subprocess.run(["curl", "-sf", f"{BASE}/health/liveliness"], capture_output=True, check=True)
@@ -206,14 +213,14 @@ def main():
         record("gateway/model-discovery", "FAIL", str(err)[:200])
 
     for name in PROVIDER_MODELS:
-        if only and name != only:
+        if args.provider and name != args.provider:
             continue
         run_suite(name)
 
     fails = [r for r in results if r[1] == "FAIL"]
     manuals = [r for r in results if r[1] == "MANUAL"]
     print(f"\n{len(results) - len(fails) - len(manuals)} pass / {len(fails)} fail / {len(manuals)} manual")
-    if fails or (require and manuals):
+    if fails or (args.require and manuals):
         sys.exit(1)
 
 

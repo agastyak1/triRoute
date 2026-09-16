@@ -2,7 +2,7 @@ FROM oven/bun:1.3-alpine AS runner
 WORKDIR /app
 
 COPY package.json ./
-RUN bun install --production || true
+RUN bun install --production
 
 COPY server.ts ./
 COPY src ./src

@@ -35,14 +35,16 @@ BRIDGE = os.path.join(ROOT, "litellm-plugin", "sitecustomize.py")
 
 EXTRACT_FUNCS = {
     "_master_key_ok", "_canonical_model", "_is_codex_model", "_is_gemini_model",
-    "_load_credentials_file", "_persist_tokens_to_secret", "TokenManager",
+    "_read_credentials_file", "_load_credentials_file", "_lock_credentials_file",
+    "_unlock_credentials_file", "_persist_tokens_to_secret", "TokenManager",
     "_require_codex_token", "_require_google_token", "_fresh_anthropic_or_die",
     "_open_sig_db", "_remember_thought_signature",
 }
 EXTRACT_ASSIGNS = {
     "TRIROUTE_ALIAS_BACKEND", "_INSECURE_MASTER_KEYS", "ANTHROPIC_OAUTH_SENTINEL",
     "CREDENTIALS_FILE", "ANTHROPIC_CLIENT_ID", "CODEX_CLIENT_ID", "GOOGLE_CLIENT_ID",
-    "GOOGLE_CLIENT_SECRET", "_ENV_TO_PROVIDER",
+    "GOOGLE_CLIENT_SECRET", "_ENV_TO_PROVIDER", "_CREDENTIAL_LOCK_TIMEOUT",
+    "_CREDENTIAL_LOCK_STALE", "_sig_db_lock",
 }
 
 
@@ -78,6 +80,7 @@ def build_namespace(fake_urlopen=None):
 
     ns = {
         "json": json, "os": _OSProxy(), "time": time, "threading": threading,
+        "tempfile": tempfile,
         "urllib": fake_urllib, "sqlite3": __import__("sqlite3"),
         "sys": types.SimpleNamespace(stderr=io.StringIO(), exit=sys.exit, _exit=os._exit),
         "ANTHROPIC_OAUTH_SENTINEL": "sk-ant-oat-triroute-managed",
@@ -136,9 +139,11 @@ class MasterKeyGuard(unittest.TestCase):
     def test_rejects_known_defaults(self):
         ns = build_namespace()
         ok = ns["_master_key_ok"]
-        for bad in ["", "sk-quota-gateway-master-key", "sk-change-me-use-a-random-value", "short1"]:
+        for bad in ["", "sk-quota-gateway-master-key", "sk-change-me-use-a-random-value", "short1",
+                    "sk-local-" + "a" * 20, "sk-local-has space-" + "a" * 24]:
             self.assertFalse(ok(bad), bad)
         self.assertTrue(ok("sk-local-" + "a" * 32))
+        self.assertTrue(ok("sk-local-" + "a" * 48))
 
 
 class Canonicalization(unittest.TestCase):
@@ -426,6 +431,14 @@ class RepoInvariants(unittest.TestCase):
         self.assertNotIn("settings.json", gw)
         self.assertNotIn("$HOME/.claude/", gw)
         self.assertNotIn(".zshrc", gw)
+
+    def test_launcher_preserves_gateway_key(self):
+        gw = open(os.path.join(ROOT, "bin", "claude-gw"), encoding="utf-8").read()
+        self.assertIn("GATEWAY_MASTER_KEY", gw)
+        self.assertIn('ANTHROPIC_AUTH_TOKEN="${GATEWAY_MASTER_KEY}"', gw)
+        # The ambient LITELLM_MASTER_KEY must be cleared without clearing the
+        # file-backed gateway key used for the child process.
+        self.assertNotIn('ANTHROPIC_AUTH_TOKEN="${LITELLM_MASTER_KEY}"', gw)
 
     def test_gitignore_protects_secrets(self):
         gi = open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read()

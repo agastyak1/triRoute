@@ -23,7 +23,7 @@ services:
       - "--num_workers"
       - "1"
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3); sys.exit(0 if r.status==200 else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "env -u PYTHONPATH python3 -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3); sys.exit(0 if r.status==200 else 1)\" || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 5

@@ -11,20 +11,30 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-LITELLM_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' "$ENV_FILE" | cut -d '=' -f2- || true)"
+GATEWAY_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' "$ENV_FILE" | cut -d '=' -f2- || true)"
 
-if [[ -z "${LITELLM_MASTER_KEY}" ]]; then
+if [[ -z "${GATEWAY_MASTER_KEY}" ]]; then
   echo "error: LITELLM_MASTER_KEY is empty in ${ENV_FILE}" >&2
   exit 1
 fi
 
-# Direct Anthropic credentials must never bypass the gateway.
+# Direct provider credentials must never bypass the gateway or leak into
+# Claude Code's tool subprocesses.
 unset ANTHROPIC_API_KEY
 unset CLAUDE_API_KEY
+unset ANTHROPIC_OAUTH_TOKEN
+unset ANTHROPIC_REFRESH_TOKEN
+unset OPENAI_CODEX_OAUTH_TOKEN
+unset OPENAI_CODEX_REFRESH_TOKEN
+unset GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+unset GOOGLE_ANTIGRAVITY_REFRESH_TOKEN
+unset GOOGLE_ANTIGRAVITY_PROJECT_ID
+unset GOOGLE_CLIENT_SECRET
+unset LITELLM_MASTER_KEY
 
 exec env \
   ANTHROPIC_BASE_URL="http://127.0.0.1:4000" \
-  ANTHROPIC_AUTH_TOKEN="${LITELLM_MASTER_KEY}" \
+  ANTHROPIC_AUTH_TOKEN="${GATEWAY_MASTER_KEY}" \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
   CLAUDE_CODE_AUTO_COMPACT_WINDOW=250000 \
   claude "$@"
