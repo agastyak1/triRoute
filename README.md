@@ -47,6 +47,7 @@ Aliases deliberately start with `claude-` so Claude Code's discovery filter show
 
 ```bash
 git clone <this repo> && cd TriRoute
+bash tests/run_tests.sh                       # offline unit/behavior suite (no docker, no network)
 ./install.sh                                  # preflight, deploy ~/ai-gateway, start stack
 # authenticate your subscriptions (browser logins — human step by design):
 python3 ~/ai-gateway/scripts/auth_helper.py claude

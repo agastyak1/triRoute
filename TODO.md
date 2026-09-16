@@ -24,12 +24,18 @@
 - [x] tests/validate.py — matrix: health, discovery, text, streaming, tool call, multi-turn per provider
 - [x] Vendored dashboard patches: 127.0.0.1 bind, OAUTH_SWEEP ownership, PKCE listener 0.0.0.0 removal
 - [x] docs: architecture, upstream-patches, plans
-- [ ] Build verification run: install.sh on this machine (containers up, health, discovery, bridge logs)
-- [ ] Negative test: insecure master key aborts container
-- [ ] docs/MANUAL_TESTS.md — OAuth walkthrough + matrix instructions [M] for user execution
+- [x] Build verification run: install.sh executed once (authorized), all phases PASSed —
+      stack healthy, loopback audit green, discovery green, error paths verified;
+      then removed with uninstall.sh (verified clean) at operator request
+- [x] Negative test: insecure master key aborts container (exit 78, observed live + unit-pinned)
+- [x] docs/MANUAL_TESTS.md — OAuth walkthrough + matrix instructions [M] for user execution
+- [x] Offline behavior test suite (operator directive: validate via unit tests, not host runs):
+      38 tests — rotating-refresh race, external-rotation adoption, atomic merge,
+      alias canonicalization, per-provider encodings, thoughtSignature SQLite,
+      auth_helper PKCE/consent/ports, config/compose invariants
 - [ ] User OAuth: claude / openai / google [M]
-- [ ] Full validation matrix pass [M, then fix any bridge fallout]
-- [ ] Final security audit + README polish + closeout commit
+- [ ] Full validation matrix pass [M — tests/validate.py; fix any bridge fallout]
+- [x] Final security audit: no secrets tracked/in history; loopback + perms pinned by tests
 
 ## Known deviations from the hardened plan (all deliberate)
 1. Plan §8 uses `chatgpt/` + `google-cloudcode/` LiteLLM providers — these do not exist in the pinned image; bridge intercepts on model-substring matching instead (upstream-proven pattern). Same aliases, same UX.
