@@ -1,0 +1,1780 @@
+# TriRoute fork of TokenGateway (MIT, Eduardo Bonassio) litellm-plugin/sitecustomize.py.
+# Deviations (see docs/upstream-patches.md):
+#   1. Credential persistence targets a local, flock-guarded credentials.json
+#      instead of Kubernetes Secrets (this deployment is single-host Docker).
+#   2. TokenManager adopts externally-rotated tokens (auth_helper / dashboard
+#      logins, or writes from the other container) before refreshing, so a
+#      single-use rotating refresh token is never spent twice -> invalid_grant.
+#   3. Anthropic /v1/messages native passthrough is supported via an OAuth
+#      sentinel key that is swapped for a live token at header-build time.
+#   4. Gateway refuses to start without a strong LITELLM_MASTER_KEY (TG-004).
+#   5. thoughtSignature cache is persisted to SQLite so multi-turn tool state
+#      survives proxy restarts mid-session.
+import functools
+import sys
+import os
+import json
+import time
+import datetime
+import uuid
+import asyncio
+import base64
+import ssl
+import sqlite3
+import urllib.request
+import urllib.parse
+import threading
+import httpx
+
+import litellm
+import litellm.main
+import litellm.router
+from litellm.types.utils import (
+    ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
+    Delta,
+    Usage,
+    PromptTokensDetailsWrapper,
+    CompletionTokensDetailsWrapper,
+)
+
+os.environ.setdefault("GEMINI_API_KEY", "dummy-antigravity")
+os.environ.setdefault("GOOGLE_API_KEY", "dummy-antigravity")
+
+# --- 1. Patch MCP spec-server (ArgoCD / Gitea) ---
+try:
+    from litellm.proxy._experimental.mcp_server import mcp_server_manager as _m
+
+    _Mgr = _m.MCPServerManager
+
+    def _wrap(name):
+        orig = getattr(_Mgr, name)
+
+        @functools.wraps(orig)
+        async def wrapper(self, server, *args, **kwargs):
+            if getattr(server, "spec_path", None):
+                return []
+            return await orig(self, server, *args, **kwargs)
+
+        setattr(_Mgr, name, wrapper)
+
+    _patched = []
+    for _n in (
+        "get_resources_from_server",
+        "get_prompts_from_server",
+        "get_resource_templates_from_server",
+    ):
+        if hasattr(_Mgr, _n):
+            _wrap(_n)
+            _patched.append(_n)
+    print(f"[sitecustomize] litellm mcp spec-server patch applied: {_patched}", file=sys.stderr)
+except Exception as _e:
+    print(f"[sitecustomize] litellm mcp patch skipped: {_e}", file=sys.stderr)
+
+# --- 0. TriRoute hardening: fail-closed master key + OAuth sentinel ---
+_INSECURE_MASTER_KEYS = {
+    "",
+    "sk-quota-gateway-master-key",
+    "sk-change-me-use-a-random-value",
+    "sk-1234",
+    "sk-12345",
+}
+_mk = os.environ.get("LITELLM_MASTER_KEY", "")
+if _mk in _INSECURE_MASTER_KEYS or len(_mk) < 16:
+    sys.stderr.write(
+        "[sitecustomize] FATAL: LITELLM_MASTER_KEY is unset, shorter than 16 chars,\n"
+        "[sitecustomize] or a known upstream default (TG-004). Generate one with\n"
+        "[sitecustomize] `openssl rand -hex 32` and set it in config/.env\n")
+    os._exit(78)
+
+# Sentinel resolved by `os.environ/ANTHROPIC_OAUTH_TOKEN` in litellm.yaml.
+# It keeps LiteLLM's native OAuth header logic (Bearer + oauth beta) and the
+# live, auto-refreshed token is swapped in at header-build time (see 2b).
+ANTHROPIC_OAUTH_SENTINEL = "sk-ant-oat-triroute-managed"
+os.environ.setdefault("ANTHROPIC_OAUTH_TOKEN", ANTHROPIC_OAUTH_SENTINEL)
+
+# --- 1b. Credential file layer, shared schema with the quota dashboard:
+#         {provider: {access, refresh, expires(ms), projectId, email, plan, authorizedAt}}
+CREDENTIALS_FILE = os.environ.get("CREDENTIALS_FILE", "/app/data/credentials.json")
+_ENV_TO_PROVIDER = {
+    "ANTHROPIC_OAUTH_TOKEN": ("anthropic", "access"),
+    "ANTHROPIC_REFRESH_TOKEN": ("anthropic", "refresh"),
+    "ANTHROPIC_EXPIRES_MS": ("anthropic", "expires"),
+    "OPENAI_CODEX_OAUTH_TOKEN": ("openai-codex", "access"),
+    "OPENAI_CODEX_REFRESH_TOKEN": ("openai-codex", "refresh"),
+    "OPENAI_CODEX_EXPIRES_MS": ("openai-codex", "expires"),
+    "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN": ("google-antigravity", "access"),
+    "GOOGLE_ANTIGRAVITY_REFRESH_TOKEN": ("google-antigravity", "refresh"),
+    "GOOGLE_ANTIGRAVITY_EXPIRES_MS": ("google-antigravity", "expires"),
+    "GOOGLE_ANTIGRAVITY_PROJECT_ID": ("google-antigravity", "projectId"),
+}
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+
+_cred_write_lock = threading.Lock()
+_cred_mtime = 0.0
+
+def _load_credentials_file():
+    try:
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+# --- 1c. persist refreshed tokens to the local credentials.json (atomic + flock) ---
+def _persist_tokens_to_secret(updates: dict):
+    if not updates:
+        return
+    with _cred_write_lock:
+        fd = None
+        try:
+            os.makedirs(os.path.dirname(CREDENTIALS_FILE) or ".", exist_ok=True)
+            fd = os.open(CREDENTIALS_FILE + ".lock", os.O_CREAT | os.O_WRONLY, 0o600)
+            if _fcntl:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            creds = _load_credentials_file()
+            for env_name, value in updates.items():
+                mapping = _ENV_TO_PROVIDER.get(env_name)
+                if not mapping or not value:
+                    continue
+                provider, field = mapping
+                entry = creds.setdefault(provider, {})
+                entry[field] = value
+                if field == "access":
+                    entry.setdefault("authorizedAt", int(time.time() * 1000))
+            tmp = CREDENTIALS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(creds, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, CREDENTIALS_FILE)
+            try:
+                global _cred_mtime
+                _cred_mtime = os.stat(CREDENTIALS_FILE).st_mtime
+            except OSError:
+                pass
+        except Exception as e:
+            print(f"[TokenManager] Warning: failed to persist credentials file: {e}", file=sys.stderr)
+        finally:
+            if fd is not None:
+                if _fcntl:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                os.close(fd)
+
+
+# --- 2. Token manager: file-backed state, race-safe rotating refresh ---
+ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+CODEX_CLIENT_ID = os.environ.get("OPENAI_CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+
+class TokenManager:
+    """Single source of truth: credentials.json (0600, atomic, flock-guarded).
+
+    Anthropic and OpenAI rotate single-use refresh tokens. Before ANY refresh
+    the manager re-reads the file under the cross-process lock: if the
+    dashboard, auth_helper, or a previous refresh already renewed the grant,
+    the rotated tokens are adopted instead of spending the (now dead) stored
+    refresh token, which would surface as invalid_grant.
+    """
+
+    REFRESH_SKEW_SECONDS = 120
+    UNKNOWN_EXPIRY_REFRESH_SECONDS = 3300
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._anthropic_token = ""
+        self._anthropic_refresh = ""
+        self._codex_token = ""
+        self._codex_refresh = ""
+        self._google_token = ""
+        self._google_refresh = ""
+        self._google_project_id = ""
+        self._expires_at = {"anthropic": 0.0, "codex": 0.0, "google": 0.0}
+        self.reload()
+
+    def reload(self):
+        global _cred_mtime
+        creds = _load_credentials_file()
+        try:
+            _cred_mtime = os.stat(CREDENTIALS_FILE).st_mtime
+        except OSError:
+            _cred_mtime = 0.0
+
+        def take(provider, field, keep):
+            entry = creds.get(provider)
+            if isinstance(entry, dict):
+                value = entry.get(field)
+                if isinstance(value, str) and value:
+                    return value
+            return keep
+
+        self._anthropic_token = take("anthropic", "access", self._anthropic_token)
+        self._anthropic_refresh = take("anthropic", "refresh", self._anthropic_refresh)
+        self._codex_token = take("openai-codex", "access", self._codex_token)
+        self._codex_refresh = take("openai-codex", "refresh", self._codex_refresh)
+        self._google_token = take("google-antigravity", "access", self._google_token)
+        self._google_refresh = take("google-antigravity", "refresh", self._google_refresh)
+        self._google_project_id = take(
+            "google-antigravity", "projectId",
+            self._google_project_id or os.environ.get("GOOGLE_ANTIGRAVITY_PROJECT_ID", ""),
+        )
+        for provider, key in (("anthropic", "anthropic"), ("openai-codex", "codex"), ("google-antigravity", "google")):
+            entry = creds.get(provider)
+            expires = entry.get("expires") if isinstance(entry, dict) else None
+            if isinstance(expires, (int, float)) and expires > 0:
+                self._expires_at[key] = float(expires) / 1000.0
+        # Bootstrap fallback: manual env export when no credential file exists yet.
+        env_token = os.environ.get("ANTHROPIC_OAUTH_TOKEN", "")
+        if env_token and env_token != ANTHROPIC_OAUTH_SENTINEL:
+            self._anthropic_token = self._anthropic_token or env_token
+            self._anthropic_refresh = self._anthropic_refresh or os.environ.get("ANTHROPIC_REFRESH_TOKEN", "")
+        self._codex_token = self._codex_token or os.environ.get("OPENAI_CODEX_OAUTH_TOKEN", "")
+        self._codex_refresh = self._codex_refresh or os.environ.get("OPENAI_CODEX_REFRESH_TOKEN", "")
+        self._google_token = self._google_token or os.environ.get("GOOGLE_ANTIGRAVITY_OAUTH_TOKEN", "")
+        self._google_refresh = self._google_refresh or os.environ.get("GOOGLE_ANTIGRAVITY_REFRESH_TOKEN", "")
+
+    def _sync_if_file_changed(self):
+        try:
+            mtime = os.stat(CREDENTIALS_FILE).st_mtime
+        except OSError:
+            return
+        if mtime != _cred_mtime:
+            self.reload()
+
+    def _needs_refresh(self, key):
+        token, refresh = {
+            "anthropic": (self._anthropic_token, self._anthropic_refresh),
+            "codex": (self._codex_token, self._codex_refresh),
+            "google": (self._google_token, self._google_refresh),
+        }[key]
+        if not refresh:
+            return False
+        if not token:
+            return True
+        expires = self._expires_at.get(key, 0.0)
+        now = time.time()
+        if expires > 0:
+            return now > expires - self.REFRESH_SKEW_SECONDS
+        return now - getattr(self, f"_last_touch_{key}", now) > self.UNKNOWN_EXPIRY_REFRESH_SECONDS
+
+    def _post_json(self, url, body: dict, headers: dict) -> dict:
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _post_form(self, url, body: dict) -> dict:
+        data = urllib.parse.urlencode(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _do_refresh(self, key):
+        """Execute one provider refresh. Callers must hold self._lock."""
+        now = time.time()
+        try:
+            if key == "anthropic":
+                res = self._post_json(
+                    "https://api.anthropic.com/v1/oauth/token",
+                    {"grant_type": "refresh_token", "client_id": ANTHROPIC_CLIENT_ID,
+                     "refresh_token": self._anthropic_refresh},
+                    {"Content-Type": "application/json", "accept": "application/json",
+                     "anthropic-beta": "oauth-2025-04-20",
+                     "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider"},
+                )
+                self._anthropic_token = res.get("access_token") or self._anthropic_token
+                self._anthropic_refresh = res.get("refresh_token") or self._anthropic_refresh
+                self._expires_at["anthropic"] = now + float(res.get("expires_in", 3600)) - 60
+                account = res.get("account") if isinstance(res.get("account"), dict) else {}
+                _persist_tokens_to_secret({
+                    "ANTHROPIC_OAUTH_TOKEN": self._anthropic_token,
+                    "ANTHROPIC_REFRESH_TOKEN": self._anthropic_refresh,
+                    "ANTHROPIC_EXPIRES_MS": int(self._expires_at["anthropic"] * 1000),
+                })
+            elif key == "codex":
+                res = self._post_form(
+                    "https://auth.openai.com/oauth/token",
+                    {"grant_type": "refresh_token", "client_id": CODEX_CLIENT_ID,
+                     "refresh_token": self._codex_refresh},
+                )
+                self._codex_token = res.get("access_token") or self._codex_token
+                self._codex_refresh = res.get("refresh_token") or self._codex_refresh
+                self._expires_at["codex"] = now + float(res.get("expires_in", 3600)) - 60
+                _persist_tokens_to_secret({
+                    "OPENAI_CODEX_OAUTH_TOKEN": self._codex_token,
+                    "OPENAI_CODEX_REFRESH_TOKEN": self._codex_refresh,
+                    "OPENAI_CODEX_EXPIRES_MS": int(self._expires_at["codex"] * 1000),
+                })
+            elif key == "google":
+                res = self._post_form(
+                    "https://oauth2.googleapis.com/token",
+                    {"grant_type": "refresh_token", "client_id": GOOGLE_CLIENT_ID,
+                     "client_secret": GOOGLE_CLIENT_SECRET,
+                     "refresh_token": self._google_refresh},
+                )
+                self._google_token = res.get("access_token") or self._google_token
+                self._expires_at["google"] = now + float(res.get("expires_in", 3600)) - 60
+                _persist_tokens_to_secret({
+                    "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN": self._google_token,
+                    "GOOGLE_ANTIGRAVITY_EXPIRES_MS": int(self._expires_at["google"] * 1000),
+                })
+            else:
+                return False
+            print(f"[TokenManager] {key} token refreshed", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[TokenManager] Failed to refresh {key} token: {e}", file=sys.stderr)
+            return False
+
+    def _get(self, key, token_getter, token_setter):
+        self._sync_if_file_changed()
+        with self._lock:
+            if self._needs_refresh(key):
+                self._do_refresh(key)
+            setattr(self, f"_last_touch_{key}", time.time())
+            return token_getter()
+
+    def get_anthropic_token(self, force_refresh=False):
+        if force_refresh:
+            with self._lock:
+                self._do_refresh("anthropic")
+                return self._anthropic_token
+        return self._get("anthropic", lambda: self._anthropic_token, None)
+
+    def get_codex_token(self, force_refresh=False):
+        if force_refresh:
+            with self._lock:
+                self._do_refresh("codex")
+                return self._codex_token
+        return self._get("codex", lambda: self._codex_token, None)
+
+    def get_google_token(self, force_refresh=False):
+        if force_refresh:
+            with self._lock:
+                self._do_refresh("google")
+                return self._google_token
+        return self._get("google", lambda: self._google_token, None)
+
+    def get_google_project_id(self):
+        self._sync_if_file_changed()
+        return self._google_project_id or os.environ.get("GOOGLE_ANTIGRAVITY_PROJECT_ID", "")
+
+_token_manager = TokenManager()
+_thought_signatures = {}
+# --- 2a. thoughtSignature persistence (SQLite, survives proxy restarts) ---
+_CACHE_DB = os.environ.get("CACHE_DB", "/app/data/session_cache.db")
+
+def _open_sig_db():
+    try:
+        os.makedirs(os.path.dirname(_CACHE_DB) or ".", exist_ok=True)
+        conn = sqlite3.connect(_CACHE_DB, timeout=10, check_same_thread=False)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS thought_signatures ("
+            "call_id TEXT PRIMARY KEY, signature TEXT NOT NULL, updated_at REAL NOT NULL)")
+        conn.commit()
+        return conn
+    except Exception as e:
+        print(f"[sitecustomize] WARNING: session cache unavailable: {e}", file=sys.stderr)
+        return None
+
+_sig_db = _open_sig_db()
+if _sig_db is not None:
+    try:
+        _sig_db.execute("DELETE FROM thought_signatures WHERE updated_at < ?", (time.time() - 86400,))
+        for _cid, _sig in _sig_db.execute("SELECT call_id, signature FROM thought_signatures"):
+            _thought_signatures[_cid] = _sig
+        print(f"[sitecustomize] session cache: loaded {len(_thought_signatures)} thoughtSignatures", file=sys.stderr)
+    except Exception as _load_err:
+        print(f"[sitecustomize] WARNING: session cache load failed: {_load_err}", file=sys.stderr)
+
+def _remember_thought_signature(call_id, signature):
+    if not call_id or not signature:
+        return
+    _thought_signatures[call_id] = signature
+    if _sig_db is None:
+        return
+    try:
+        _sig_db.execute(
+            "INSERT OR REPLACE INTO thought_signatures (call_id, signature, updated_at) VALUES (?,?,?)",
+            (call_id, signature, time.time()))
+        _sig_db.commit()
+    except Exception:
+        pass
+
+# --- 2b. Anthropic OAuth sentinel swap for LiteLLM's native /v1/messages path ---
+# litellm.yaml resolves `os.environ/ANTHROPIC_OAUTH_TOKEN` once at config load,
+# so the deployments carry the sentinel forever. Every outbound header build
+# swaps the sentinel for the live, auto-refreshed token. All known call sites
+# (chat handler, native messages transformation, count_tokens, validate_environment)
+# route through these two functions.
+def _fresh_anthropic_or_die():
+    token = _token_manager.get_anthropic_token()
+    if not token or token == ANTHROPIC_OAUTH_SENTINEL:
+        raise RuntimeError(
+            "Anthropic subscription not authenticated. Open http://127.0.0.1:3737 "
+            "and click Connect under Anthropic, or run scripts/auth_helper.py anthropic.")
+    return token
+
+try:
+    from litellm.llms.anthropic import common_utils as _anth_cu
+
+    _orig_get_anthropic_headers = _anth_cu.AnthropicConfig.get_anthropic_headers
+
+    def _swapped_get_anthropic_headers(self, *args, **kwargs):
+        if kwargs.get("api_key") == ANTHROPIC_OAUTH_SENTINEL:
+            kwargs["api_key"] = _fresh_anthropic_or_die()
+        return _orig_get_anthropic_headers(self, *args, **kwargs)
+
+    _anth_cu.AnthropicConfig.get_anthropic_headers = _swapped_get_anthropic_headers
+
+    _orig_opt_oauth = _anth_cu.optionally_handle_anthropic_oauth
+
+    def _swapped_opt_oauth(headers, api_key):
+        if api_key == ANTHROPIC_OAUTH_SENTINEL:
+            api_key = _fresh_anthropic_or_die()
+        if isinstance(headers, dict):
+            auth = str(headers.get("authorization") or headers.get("Authorization") or "")
+            if auth == f"Bearer {ANTHROPIC_OAUTH_SENTINEL}":
+                headers["authorization"] = f"Bearer {_fresh_anthropic_or_die()}"
+        return _orig_opt_oauth(headers=headers, api_key=api_key)
+
+    _anth_cu.optionally_handle_anthropic_oauth = _swapped_opt_oauth
+    # Modules that `from ... import optionally_handle_anthropic_oauth` hold their
+    # own binding; patch every importer (names verified against the pinned image).
+    _importers = []
+    try:
+        from litellm.llms.anthropic.count_tokens import transformation as _ct
+        _ct.optionally_handle_anthropic_oauth = _swapped_opt_oauth
+        _importers.append("count_tokens")
+    except Exception:
+        pass
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.messages import transformation as _mt
+        _mt.optionally_handle_anthropic_oauth = _swapped_opt_oauth
+        _importers.append("messages_passthrough")
+    except Exception:
+        pass
+    print(f"[sitecustomize] anthropic oauth sentinel swap enabled ({', '.join(_importers)})", file=sys.stderr)
+except Exception as _swap_err:
+    print(f"[sitecustomize] WARNING: anthropic oauth sentinel swap not applied: {_swap_err}", file=sys.stderr)
+
+
+# --- 3. Wire protocol adapters for Claude Code, OpenAI Codex, and Google Antigravity ---
+# Anthropic OAuth validates this exact Agent SDK identity as the sole system message.
+CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+# Ported from @oh-my-pi/pi-ai (Azr/Mzr/X$s). Anthropic caches everything *up to*
+# a breakpoint, so OMP places no marker on `system` at all: two markers on the
+# last messages already cover tools + system + the whole history. Two adjacent
+# anchors (not one) keep a valid entry to extend from as the conversation grows.
+ANTHROPIC_CACHE_BREAKPOINT_MESSAGES = 2
+
+# X$s: retention defaults to "short", i.e. a bare ephemeral marker (5m). The 1h
+# TTL is opt-in ("long" retention on models that support it) because a 1h write
+# costs 2x base against 1.25x for 5m.
+def _anthropic_cache_control():
+    return {"type": "ephemeral"}
+
+# Azr: blocks that carry reasoning are never valid anchors.
+_ANTHROPIC_UNCACHEABLE_BLOCKS = ("thinking", "redacted_thinking", "fallback")
+
+def _anthropic_markable_message(message):
+    """Whether a breakpoint can be attached without corrupting structured payloads.
+
+    Deviation from the reference, forced by the wire shape: OMP marks Anthropic
+    messages, where tool results are `tool_result` blocks inside a user turn. We
+    see the OpenAI shape, where a tool result is its own `role: "tool"` message
+    and an assistant tool call carries `content: None`. Rewriting either into a
+    text block breaks the conversion LiteLLM performs downstream.
+    """
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") not in ("user", "assistant", "developer"):
+        return False
+    if message.get("tool_calls") or message.get("tool_call_id"):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict)
+            and block.get("type") not in _ANTHROPIC_UNCACHEABLE_BLOCKS
+            and str(block.get("text", "")).strip()
+            for block in content
+        )
+    return False
+
+def _count_cache_breakpoints(messages):
+    total = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            total += sum(
+                1 for block in content
+                if isinstance(block, dict) and block.get("cache_control")
+            )
+    return total
+
+def _mark_cache_breakpoint(message):
+    """Azr: mark the last non-reasoning block; bail when one is already marked."""
+    control = _anthropic_cache_control()
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = [{"type": "text", "text": content, "cache_control": control}]
+        return True
+    if not isinstance(content, list):
+        return False
+    for index in range(len(content) - 1, -1, -1):
+        block = content[index]
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in _ANTHROPIC_UNCACHEABLE_BLOCKS:
+            continue
+        if block.get("cache_control") is not None:
+            return False
+        if not str(block.get("text", "")).strip():
+            continue
+        block["cache_control"] = control
+        return True
+    return False
+
+def _apply_conversation_cache(messages):
+    """Mzr: anchor breakpoints on the last markable messages."""
+    anchors = [i for i, m in enumerate(messages) if _anthropic_markable_message(m)]
+    if not anchors:
+        return 0
+    # A trailing synthetic "Continue." nudge is not a useful anchor.
+    last = messages[anchors[-1]]
+    if (
+        last.get("role") == "user"
+        and last.get("content") == "Continue."
+        and len(anchors) > 1
+    ):
+        anchors = anchors[:-1]
+    marked = 0
+    for index in reversed(anchors[-ANTHROPIC_CACHE_BREAKPOINT_MESSAGES:]):
+        message = dict(messages[index])
+        if isinstance(message.get("content"), list):
+            message["content"] = [
+                dict(block) if isinstance(block, dict) else block
+                for block in message["content"]
+            ]
+        if _mark_cache_breakpoint(message):
+            messages[index] = message
+            marked += 1
+    return marked
+
+def _inject_claude_prompt(kwargs, args=None):
+    model = str(kwargs.get("model", "") or (args[0] if args and len(args) > 0 else "")).lower()
+    if "claude" not in model and "anthropic" not in model:
+        return kwargs
+
+    fresh_anthropic_token = _token_manager.get_anthropic_token()
+    if fresh_anthropic_token:
+        kwargs["api_key"] = fresh_anthropic_token
+        os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
+
+    extra_headers = kwargs.setdefault("extra_headers", {})
+    if isinstance(extra_headers, dict):
+        extra_headers["anthropic-beta"] = (
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
+            "redact-thinking-2026-02-12,context-management-2025-06-27,"
+            "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
+            "advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
+        )
+        extra_headers["User-Agent"] = "claude-cli/2.1.246 (external, claude-desktop)"
+
+    reasoning = kwargs.get("reasoning_effort")
+    thinking = kwargs.get("thinking")
+    thinking_active = bool(thinking or reasoning in ("high", "medium", "low"))
+    temperature = kwargs.get("temperature")
+    if temperature is not None and float(temperature) != 1.0:
+        if thinking_active:
+            kwargs["temperature"] = 1.0
+        else:
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking", None)
+            thinking_active = False
+
+    # Claude Max reserves max_tokens against its short TPM window. Bound extended
+    # thinking requests so OMP's 64k-128k defaults do not cause an immediate 429.
+    # OMP sends max_completion_tokens (OpenAI-style), not max_tokens; both must be
+    # clamped in lockstep or the uncapped key still reaches Anthropic downstream.
+    if thinking_active:
+        if isinstance(thinking, dict):
+            budget = thinking.get("budget_tokens", 4096)
+            if budget > 8192:
+                thinking["budget_tokens"] = 8192
+                budget = 8192
+        else:
+            budget = {"low": 2048, "medium": 4096, "high": 8192}.get(str(reasoning).lower(), 4096)
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs.pop("reasoning_effort", None)
+
+        for _tok_key in ("max_tokens", "max_completion_tokens"):
+            _tok_val = kwargs.get(_tok_key)
+            if _tok_val is None or _tok_val > 16384:
+                kwargs[_tok_key] = 16384
+            elif _tok_val <= budget:
+                kwargs[_tok_key] = budget + 2048
+        if "max_completion_tokens" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+
+    messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
+    if not isinstance(messages, list):
+        return kwargs
+
+    # Keep OAuth's required Agent SDK identity isolated in system. Anthropic returns
+    # 429 when any client instruction shares this message or appears in another system
+    # message. Move client system instructions to the first user turn and cache them.
+    system_parts = []
+    non_system_messages = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            non_system_messages.append(message)
+            continue
+
+        content = message.get("content", "")
+        if isinstance(content, str):
+            system_parts.append(content)
+        elif isinstance(content, list):
+            system_parts.extend(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+
+    client_system_prompt = "\n\n".join(
+        part.strip().replace(CLAUDE_CODE_PROMPT, "").strip()
+        for part in system_parts
+        if part.strip()
+    )
+    claude_identity = {
+        "role": "system",
+        "content": [{"type": "text", "text": CLAUDE_CODE_PROMPT}],
+    }
+
+    instructions_index = None
+    if client_system_prompt:
+        cached_instructions = {
+            "type": "text",
+            "text": (
+                "<client_system_instructions>\n"
+                f"{client_system_prompt}\n"
+                "</client_system_instructions>"
+            ),
+        }
+        first_user_index = next(
+            (
+                index
+                for index, message in enumerate(non_system_messages)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            None,
+        )
+        if first_user_index is None:
+            non_system_messages.insert(0, {"role": "user", "content": [cached_instructions]})
+            instructions_index = 0
+        else:
+            first_user = dict(non_system_messages[first_user_index])
+            user_content = first_user.get("content", "")
+            if isinstance(user_content, list):
+                first_user["content"] = [cached_instructions] + list(user_content)
+            else:
+                first_user["content"] = [
+                    cached_instructions,
+                    {"type": "text", "text": str(user_content)},
+                ]
+            non_system_messages[first_user_index] = first_user
+            instructions_index = first_user_index
+
+    if not _apply_conversation_cache(non_system_messages) and instructions_index is not None:
+        # Deviation from the reference: in the OpenAI shape a turn can end with
+        # tool results only, leaving nothing markable. OMP never hits this because
+        # Anthropic messages always end on a user/assistant turn. Fall back to the
+        # instructions block so the static prefix still gets cached.
+        fallback = dict(non_system_messages[instructions_index])
+        fallback["content"] = [
+            dict(block) if isinstance(block, dict) else block
+            for block in fallback["content"]
+        ]
+        if _mark_cache_breakpoint(fallback):
+            non_system_messages[instructions_index] = fallback
+
+    kwargs["messages"] = [claude_identity] + non_system_messages
+    return kwargs
+
+# --- 3.1. OpenAI Codex Bridge ---
+def _is_codex_model(model_str):
+    m = str(model_str).lower()
+    return "gpt-5" in m or "codex" in m
+
+def _extract_account_id(tok):
+    try:
+        parts = tok.split(".")
+        if len(parts) != 3:
+            return None
+        padding = len(parts[1]) % 4
+        padded = parts[1] + ("=" * (4 - padding) if padding else "")
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        return payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+    except:
+        return None
+
+def _build_codex_headers(tok):
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+        "accept": "text/event-stream",
+        "originator": "pi",
+        "OpenAI-Beta": "responses=experimental",
+        "User-Agent": "pi (linux; x86_64)"
+    }
+    acc = _extract_account_id(tok)
+    if acc:
+        headers["chatgpt-account-id"] = acc
+    return headers
+def _content_to_text(content):
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text")
+        )
+    return str(content) if content is not None else ""
+
+def _repair_codex_tool_pairs(items):
+    calls = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    outputs = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+    repaired = []
+    for item in items:
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call_output" and call_id not in calls:
+            repaired.append({
+                "type": "message",
+                "role": "assistant",
+                "content": f"[Previous tool result; call_id={call_id}]: {_content_to_text(item.get('output'))}",
+            })
+        else:
+            repaired.append(item)
+        if item.get("type") == "function_call" and call_id not in outputs:
+            repaired.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "[No tool output recorded: the tool call was interrupted before it produced a result.]",
+            })
+    return repaired
+
+def _messages_to_codex_input(messages):
+    codex_input = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content")
+        if role == "tool":
+            codex_input.append({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id") or "",
+                "output": _content_to_text(content),
+            })
+            continue
+
+        content_text = _content_to_text(content)
+        codex_role = "developer" if role == "system" else role
+        if codex_role not in ("user", "assistant", "developer"):
+            codex_role = "user"
+        if content_text:
+            codex_input.append({
+                "type": "message",
+                "role": codex_role,
+                "content": [{"type": "output_text" if codex_role == "assistant" else "input_text", "text": content_text}],
+            })
+
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            arguments = function.get("arguments") or "{}"
+            codex_input.append({
+                "type": "function_call",
+                "call_id": tool_call.get("id") or "",
+                "name": function.get("name") or "",
+                "arguments": json.dumps(arguments) if isinstance(arguments, dict) else arguments,
+            })
+    return _repair_codex_tool_pairs(codex_input)
+
+def _tools_to_codex_tools(tools):
+    if not tools:
+        return None
+    codex_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not function.get("name"):
+            continue
+        codex_tools.append({
+            "type": "function",
+            "name": function["name"],
+            "description": function.get("description") or "",
+            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return codex_tools or None
+
+def _codex_tool_choice(choice):
+    if not isinstance(choice, dict):
+        return choice
+    function = choice.get("function")
+    if choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
+        return {"type": "function", "name": function["name"]}
+    return choice
+
+# --- Upstream usage normalisation (ported from @oh-my-pi/pi-ai) ---
+# Both bridges answer requests themselves, so whatever they omit here is lost:
+# LiteLLM then falls back to token_counter estimates and every cache hit is
+# invisible in /spend/logs.
+def _bridge_usage(prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0, total_tokens=None):
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    cached_tokens = max(0, int(cached_tokens or 0))
+    reasoning_tokens = max(0, int(reasoning_tokens or 0))
+    usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=int(total_tokens) if total_tokens else prompt_tokens + completion_tokens,
+    )
+    if cached_tokens:
+        usage.prompt_tokens_details = PromptTokensDetailsWrapper(cached_tokens=cached_tokens)
+        # LiteLLM's spend logging reads this attribute, not the details wrapper.
+        setattr(usage, "cache_read_input_tokens", cached_tokens)
+    if reasoning_tokens:
+        usage.completion_tokens_details = CompletionTokensDetailsWrapper(
+            reasoning_tokens=reasoning_tokens
+        )
+    return usage
+
+def _google_usage(meta):
+    """omp-google-shared.ts: promptTokenCount *includes* cached tokens, so it is
+    subtracted to avoid double-counting, and thoughts count as output."""
+    cached = meta.get("cachedContentTokenCount") or 0
+    thinking = meta.get("thoughtsTokenCount") or 0
+    return _bridge_usage(
+        prompt_tokens=(meta.get("promptTokenCount") or 0) - cached,
+        completion_tokens=(meta.get("candidatesTokenCount") or 0) + thinking,
+        cached_tokens=cached,
+        reasoning_tokens=thinking,
+        total_tokens=meta.get("totalTokenCount"),
+    )
+
+def _codex_usage(meta):
+    """OMP `eRe`: unlike Google, input_tokens is not reduced by cached_tokens."""
+    details = meta.get("input_tokens_details") or {}
+    out_details = meta.get("output_tokens_details") or {}
+    cached = details.get("cached_tokens")
+    if cached is None:
+        cached = meta.get("prompt_cache_hit_tokens") or 0
+    return _bridge_usage(
+        prompt_tokens=meta.get("input_tokens") or 0,
+        completion_tokens=meta.get("output_tokens") or 0,
+        cached_tokens=cached,
+        reasoning_tokens=out_details.get("reasoning_tokens") or 0,
+        total_tokens=meta.get("total_tokens"),
+    )
+
+def _usage_chunk(model, response_id, created, usage):
+    """Final stream chunk carrying real usage; without it LiteLLM estimates."""
+    chunk = ModelResponseStream(id=response_id, created=created, model=model, choices=[])
+    setattr(chunk, "usage", usage)
+    return chunk
+
+# --- Spend logging for bridge-served responses ---
+# The Codex and Antigravity bridges answer requests themselves, so LiteLLM never
+# wraps them in CustomStreamWrapper and no success callback fires. Without this,
+# successful bridge completions are absent from /spend/logs entirely and only
+# their exceptions get recorded by the proxy error handler.
+async def _emit_bridge_success(logging_obj, response, start_time, end_time):
+    if logging_obj is None or response is None:
+        return
+    try:
+        await logging_obj.async_success_handler(response, start_time, end_time)
+    except Exception as log_err:
+        print(f"[sitecustomize] bridge spend log failed: {log_err}", file=sys.stderr)
+
+async def _logged_bridge_stream(generator, logging_obj, messages, start_time):
+    """Pass bridge chunks through untouched, then emit one spend-log row.
+
+    Reassembly is best effort: a logging failure must never break an otherwise
+    healthy stream. Client disconnects skip the record rather than awaiting
+    inside a closing generator.
+    """
+    chunks = []
+    async for chunk in generator:
+        chunks.append(chunk)
+        yield chunk
+    if logging_obj is None or not chunks:
+        return
+    try:
+        end_time = datetime.datetime.now()
+        response = litellm.stream_chunk_builder(
+            chunks, messages=messages, start_time=start_time, end_time=end_time
+        )
+        await _emit_bridge_success(logging_obj, response, start_time, end_time)
+    except Exception as log_err:
+        print(f"[sitecustomize] bridge stream spend log failed: {log_err}", file=sys.stderr)
+
+def _strip_codex_output_limits(kwargs):
+    for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+        kwargs.pop(key, None)
+    if isinstance(kwargs.get("extra_body"), dict):
+        for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+            kwargs["extra_body"].pop(key, None)
+
+def _codex_request_body(model, messages, tools, extra_kwargs):
+    body = {
+        "model": model.split("/")[-1],
+        "store": False,
+        "stream": True,
+        "input": _messages_to_codex_input(messages),
+    }
+    codex_tools = _tools_to_codex_tools(tools)
+    if codex_tools:
+        body["tools"] = codex_tools
+    if extra_kwargs:
+        tool_choice = _codex_tool_choice(extra_kwargs.get("tool_choice"))
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        effort = extra_kwargs.get("reasoning_effort")
+        if effort is not None:
+            body["reasoning"] = {
+                "effort": str(effort).lower(),
+                "summary": "auto",
+                "context": "all_turns",
+            }
+        if extra_kwargs.get("service_tier") is not None:
+            body["service_tier"] = extra_kwargs["service_tier"]
+    return body
+
+def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
+    url = "https://chatgpt.com/backend-api/codex/responses"
+    body = _codex_request_body(model, messages, tools, extra_kwargs)
+    headers = _build_codex_headers(token)
+
+    full_text = []
+    tool_calls = []
+    active_tools = {}
+    usage_meta = {}
+
+    with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
+        resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
+        if resp.status_code == 401:
+            resp.close()
+            fresh_token = _token_manager.get_codex_token(force_refresh=True)
+            if fresh_token:
+                headers = _build_codex_headers(fresh_token)
+                resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
+            else:
+                resp.raise_for_status()
+        if resp.status_code != 200:
+            err_text = resp.read().decode("utf-8", "replace")
+            resp.close()
+            raise Exception(f"OpenAI Codex error {resp.status_code}: {err_text}")
+
+        for line in resp.iter_lines():
+            line_str = line.strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                    etype = event.get("type")
+                    if etype == "response.output_item.added":
+                        item = event.get("item", {})
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                            active_tools[item.get("id")] = {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": item.get("name", ""), "arguments": ""}
+                            }
+                    elif etype == "response.function_call_arguments.delta":
+                        item_id = event.get("item_id")
+                        if item_id in active_tools:
+                            active_tools[item_id]["function"]["arguments"] += event.get("delta", "")
+                    elif etype == "response.output_item.done":
+                        item = event.get("item", {})
+                        if item.get("type") == "function_call":
+                            item_id = item.get("id")
+                            if item_id in active_tools:
+                                if item.get("arguments"):
+                                    active_tools[item_id]["function"]["arguments"] = item.get("arguments")
+                                tool_calls.append(active_tools.pop(item_id))
+                    elif etype == "response.output_text.delta":
+                        full_text.append(event.get("delta", ""))
+                    elif etype == "response.completed":
+                        usage_meta = event.get("response", {}).get("usage") or {}
+                    elif etype in ["response.failed", "error"]:
+                        err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
+                        raise Exception(f"OpenAI Codex stream failed: {err_obj}")
+                except Exception as parse_err:
+                    if "OpenAI Codex stream failed" in str(parse_err):
+                        raise parse_err
+                    pass
+        resp.close()
+
+    return "".join(full_text), tool_calls, _codex_usage(usage_meta)
+async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
+    url = "https://chatgpt.com/backend-api/codex/responses"
+    body = _codex_request_body(model, messages, tools, extra_kwargs)
+    headers = _build_codex_headers(token)
+
+    resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    active_tool_map = {}
+    current_tool_index = 0
+    has_tool_calls = False
+    completion_status = "completed"
+    usage_meta = {}
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
+        resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
+        if resp.status_code == 401:
+            await resp.aclose()
+            fresh_token = _token_manager.get_codex_token(force_refresh=True)
+            if fresh_token:
+                headers = _build_codex_headers(fresh_token)
+                resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
+            else:
+                resp.raise_for_status()
+        if resp.status_code != 200:
+            err_text = (await resp.aread()).decode("utf-8", "replace")
+            await resp.aclose()
+            raise Exception(f"OpenAI Codex error {resp.status_code}: {err_text}")
+
+        async for line in resp.aiter_lines():
+            line_str = line.strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                    etype = event.get("type")
+
+                    if etype == "response.output_item.added":
+                        item = event.get("item", {})
+                        if item.get("type") == "function_call":
+                            has_tool_calls = True
+                            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                            fn_name = item.get("name", "")
+                            active_tool_map[item.get("id")] = (current_tool_index, call_id, fn_name)
+                            yield ModelResponseStream(
+                                id=resp_id,
+                                created=created,
+                                model=model,
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(
+                                        role="assistant",
+                                        tool_calls=[{
+                                            "index": current_tool_index,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": fn_name,
+                                                "arguments": ""
+                                            }
+                                        }]
+                                    ),
+                                    finish_reason=None
+                                )]
+                            )
+                            current_tool_index += 1
+
+                    elif etype == "response.function_call_arguments.delta":
+                        item_id = event.get("item_id")
+                        tinfo = active_tool_map.get(item_id)
+                        tindex = tinfo[0] if tinfo else 0
+                        delta = event.get("delta", "")
+                        if delta:
+                            yield ModelResponseStream(
+                                id=resp_id,
+                                created=created,
+                                model=model,
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(
+                                        tool_calls=[{
+                                            "index": tindex,
+                                            "function": {
+                                                "arguments": delta
+                                            }
+                                        }]
+                                    ),
+                                    finish_reason=None
+                                )]
+                            )
+
+                    elif etype in ["response.reasoning_text.delta", "response.reasoning_summary_text.delta"]:
+                        delta = event.get("delta", "")
+                        if delta:
+                            yield ModelResponseStream(
+                                id=resp_id,
+                                created=created,
+                                model=model,
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(reasoning_content=delta),
+                                    finish_reason=None
+                                )]
+                            )
+
+                    elif etype in ["response.output_text.delta", "response.refusal.delta"]:
+                        delta = event.get("delta", "")
+                        if delta:
+                            yield ModelResponseStream(
+                                id=resp_id,
+                                created=created,
+                                model=model,
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(content=delta),
+                                    finish_reason=None
+                                )]
+                            )
+                    elif etype == "response.completed":
+                        resp_data = event.get("response", {})
+                        completion_status = resp_data.get("status", "completed")
+                        usage_meta = resp_data.get("usage") or {}
+                    elif etype in ["response.failed", "error"]:
+                        err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
+                        raise Exception(f"OpenAI Codex stream failed: {err_obj}")
+                except Exception as parse_err:
+                    if "OpenAI Codex stream failed" in str(parse_err):
+                        raise parse_err
+                    pass
+        await resp.aclose()
+    finish_reason = "tool_calls" if has_tool_calls else ("length" if completion_status == "incomplete" else "stop")
+    yield ModelResponseStream(
+        id=resp_id,
+        created=created,
+        model=model,
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
+    )
+    # Without a usage-bearing chunk LiteLLM falls back to token_counter estimates
+    # and every cached token stays invisible in /spend/logs.
+    yield _usage_chunk(model, resp_id, created, _codex_usage(usage_meta))
+# --- 3.2. Google Antigravity Bridge ---
+def _is_gemini_model(model_str):
+    m = str(model_str).lower()
+    return "gemini" in m or "antigravity" in m
+
+def _map_antigravity_model(model_str):
+    raw = model_str.split("/")[-1].lower()
+    mapping = {
+        "gemini-3.7-flash-thinking": "gemini-3.7-flash-low",
+        "gemini-3.7-flash-tiered": "gemini-3.7-flash-low",
+        "gemini-3.7-flash": "gemini-3.7-flash-low",
+        "gemini-3.6-flash": "gemini-3.6-flash-low",
+        "gemini-3.5-flash": "gemini-3.5-flash-extra-low",
+        "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
+        "gemini-3.1-pro": "gemini-3.1-pro-low",
+        "gemini-3-flash": "gemini-3-flash",
+        "gemini-3-pro": "gemini-3-pro-low",
+        "gemini-2.5-pro": "gemini-2.5-pro",
+        "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+        "gemini-2.5-flash": "gemini-2.5-flash",
+    }
+    for k, v in mapping.items():
+        if k in raw:
+            return v
+    return "gemini-2.5-flash"
+
+def _google_model_supports_function_ids(model):
+    return model.split("/")[-1].lower().startswith("gemini-3")
+
+def _google_text_parts(content):
+    if isinstance(content, list):
+        return [
+            {"text": str(part.get("text", ""))}
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text") and part.get("text")
+        ]
+    return [{"text": str(content)}] if content is not None and str(content) else []
+
+def _google_tool_choice(choice, declarations):
+    if choice in (None, "auto"):
+        return {"functionCallingConfig": {"mode": "AUTO"}}
+    if choice == "none":
+        return {"functionCallingConfig": {"mode": "NONE"}}
+    if choice in ("required", "any"):
+        return {"functionCallingConfig": {"mode": "ANY"}}
+    if isinstance(choice, dict):
+        function = choice.get("function") or choice
+        name = function.get("name") if isinstance(function, dict) else None
+        if name and any(declaration.get("name") == name for declaration in declarations):
+            return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
+    return {"functionCallingConfig": {"mode": "AUTO"}}
+
+def _tools_to_antigravity_tools(model, tools):
+    if not tools:
+        return None, []
+    declarations = []
+    use_legacy_parameters = model.split("/")[-1].lower().startswith("claude-")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        schema = function.get("parameters") or {"type": "object", "properties": {}}
+        declaration = {"name": name, "description": str(function.get("description") or "")}
+        declaration["parameters" if use_legacy_parameters else "parametersJsonSchema"] = schema
+        declarations.append(declaration)
+    return ([{"functionDeclarations": declarations}] if declarations else None), declarations
+
+def _tool_result_value(message):
+    content = message.get("content")
+    text = "".join(part.get("text", "") for part in content if isinstance(part, dict)) if isinstance(content, list) else str(content or "")
+    value = {"error" if message.get("is_error") else "output": text}
+    return value
+
+def _messages_to_antigravity_payload(model, messages, project_id, tools=None, extra_kwargs=None):
+    mapped_model = _map_antigravity_model(model)
+    contents = []
+    system_parts = []
+    tool_names = {}
+    supports_ids = _google_model_supports_function_ids(model)
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            call_id = (tool_call.get("id") or "").split("|", 1)[0]
+            if call_id:
+                tool_names[call_id] = function.get("name") or "tool"
+
+    pending_tool_responses = []
+    def flush_tool_responses():
+        nonlocal pending_tool_responses
+        if pending_tool_responses:
+            contents.append({"role": "user", "parts": pending_tool_responses})
+            pending_tool_responses = []
+
+    for message in messages:
+        role = message.get("role", "user") if isinstance(message, dict) else "user"
+        if role != "tool":
+            flush_tool_responses()
+        content = message.get("content") if isinstance(message, dict) else None
+        if role == "tool":
+            encoded_call_id = message.get("tool_call_id") or ""
+            call_id = encoded_call_id.split("|", 1)[0]
+            function_response = {
+                "name": message.get("name") or tool_names.get(call_id) or "tool",
+                "response": _tool_result_value(message),
+            }
+            if supports_ids and call_id:
+                function_response["id"] = call_id
+            pending_tool_responses.append({"functionResponse": function_response})
+            continue
+
+        parts = _google_text_parts(content)
+        if role == "system":
+            system_parts.extend(parts)
+        elif role == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call.get("function") or {}
+                encoded_call_id = tool_call.get("id") or ""
+                call_id, _, signature = encoded_call_id.partition("|")
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"__raw": arguments}
+                function_call = {"name": function.get("name") or "", "args": arguments}
+                if supports_ids and call_id:
+                    function_call["id"] = call_id
+                part = {"functionCall": function_call}
+                signature = tool_call.get("thoughtSignature") or tool_call.get("thought_signature") or signature or _thought_signatures.get(call_id)
+                if signature:
+                    part["thoughtSignature"] = signature
+                parts.append(part)
+            if parts:
+                contents.append({"role": "model", "parts": parts})
+        elif parts:
+            contents.append({"role": "user", "parts": parts})
+    flush_tool_responses()
+
+    # OMP sends max_completion_tokens (OpenAI-style); accept both spellings or
+    # the client's requested output ceiling is silently replaced by the default.
+    _extra = extra_kwargs or {}
+    max_tokens = _extra.get("max_tokens") or _extra.get("max_completion_tokens") or 64000
+    request_obj = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
+    if "thinking" in model.lower():
+        request_obj["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
+    if system_parts:
+        request_obj["systemInstruction"] = {"parts": system_parts}
+    antigravity_tools, declarations = _tools_to_antigravity_tools(model, tools)
+    if antigravity_tools:
+        request_obj["tools"] = antigravity_tools
+        request_obj["toolConfig"] = _google_tool_choice((extra_kwargs or {}).get("tool_choice"), declarations)
+    return {
+        "project": project_id,
+        "requestId": str(uuid.uuid4()),
+        "model": mapped_model,
+        "userAgent": "antigravity",
+        "requestType": "agent",
+        "request": request_obj,
+    }
+
+def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra_kwargs=None):
+    url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
+    }
+
+    full_text = []
+    tool_calls = []
+    usage_meta = {}
+
+    with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
+        resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+        if resp.status_code == 401:
+            resp.close()
+            fresh_token = _token_manager.get_google_token(force_refresh=True)
+            if fresh_token:
+                headers["Authorization"] = f"Bearer {fresh_token}"
+                resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+            else:
+                resp.raise_for_status()
+        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
+            resp.close()
+            payload["model"] = "gemini-3.7-flash-low"
+            resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+
+        if resp.status_code != 200:
+            err_text = resp.read().decode("utf-8", "replace")
+            resp.close()
+            raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
+
+        for line in resp.iter_lines():
+            line_str = line.strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                    resp_obj = event.get("response", {})
+                    candidates = resp_obj.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for p in parts:
+                            txt = p.get("text", "")
+                            if txt:
+                                full_text.append(txt)
+                            fc = p.get("functionCall")
+                            if fc:
+                                tsig = p.get("thoughtSignature")
+                                call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                                if tsig:
+                                    _remember_thought_signature(call_id, tsig)
+                                fn_name = fc.get("name", "")
+                                fn_args = json.dumps(fc.get("args") or {})
+                                tool_calls.append({
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": fn_name, "arguments": fn_args}
+                                })
+                    usage = resp_obj.get("usageMetadata", {})
+                    if usage:
+                        usage_meta = usage
+                except:
+                    pass
+        resp.close()
+
+    return "".join(full_text), tool_calls, _google_usage(usage_meta)
+
+async def _stream_antigravity_generator(model, messages, token, project_id, tools=None, extra_kwargs=None):
+    url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
+    }
+
+    resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    current_tool_index = 0
+    has_tool_calls = False
+    usage_meta = {}
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
+        resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+        if resp.status_code == 401:
+            await resp.aclose()
+            fresh_token = _token_manager.get_google_token(force_refresh=True)
+            if fresh_token:
+                headers["Authorization"] = f"Bearer {fresh_token}"
+                resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+            else:
+                resp.raise_for_status()
+        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
+            await resp.aclose()
+            payload["model"] = "gemini-3.7-flash-low"
+            resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+
+        if resp.status_code != 200:
+            err_text = (await resp.aread()).decode("utf-8", "replace")
+            await resp.aclose()
+            raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
+
+        async for line in resp.aiter_lines():
+            line_str = line.strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                    resp_obj = event.get("response", {})
+                    usage_meta = resp_obj.get("usageMetadata") or usage_meta
+                    candidates = resp_obj.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for p in parts:
+                            txt = p.get("text", "")
+                            if txt:
+                                is_thought = bool(p.get("thought", False))
+                                delta_obj = Delta(reasoning_content=txt) if is_thought else Delta(content=txt)
+                                yield ModelResponseStream(
+                                    id=resp_id,
+                                    created=created,
+                                    model=model,
+                                    choices=[StreamingChoices(index=0, delta=delta_obj, finish_reason=None)]
+                                )
+                            fc = p.get("functionCall")
+                            if fc:
+                                has_tool_calls = True
+                                tsig = p.get("thoughtSignature")
+                                call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                                if tsig:
+                                    _remember_thought_signature(call_id, tsig)
+                                fn_name = fc.get("name", "")
+                                fn_args = json.dumps(fc.get("args") or {})
+
+                                yield ModelResponseStream(
+                                    id=resp_id,
+                                    created=created,
+                                    model=model,
+                                    choices=[StreamingChoices(
+                                        index=0,
+                                        delta=Delta(
+                                            role="assistant",
+                                            tool_calls=[{
+                                                "index": current_tool_index,
+                                                "id": call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": fn_name,
+                                                    "arguments": ""
+                                                }
+                                            }]
+                                        ),
+                                        finish_reason=None
+                                    )]
+                                )
+                                yield ModelResponseStream(
+                                    id=resp_id,
+                                    created=created,
+                                    model=model,
+                                    choices=[StreamingChoices(
+                                        index=0,
+                                        delta=Delta(
+                                            tool_calls=[{
+                                                "index": current_tool_index,
+                                                "function": {
+                                                    "arguments": fn_args
+                                                }
+                                            }]
+                                        ),
+                                        finish_reason=None
+                                    )]
+                                )
+                                current_tool_index += 1
+                except Exception as e:
+                    pass
+        await resp.aclose()
+
+    finish_reason = "tool_calls" if has_tool_calls else "stop"
+    yield ModelResponseStream(
+        id=resp_id,
+        created=created,
+        model=model,
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
+    )
+    # Without a usage-bearing chunk LiteLLM falls back to token_counter estimates
+    # and every implicitly cached token stays invisible in /spend/logs.
+    yield _usage_chunk(model, resp_id, created, _google_usage(usage_meta))
+
+# --- 4. Monkey-patch litellm.main.acompletion e litellm.main.completion ---
+try:
+    _orig_acompletion = litellm.main.acompletion
+    async def _wrapped_acompletion(*args, **kwargs):
+        # Normalise positional args (model, messages) into kwargs
+        if len(args) > 0 and "model" not in kwargs:
+            kwargs["model"] = args[0]
+        if len(args) > 1 and "messages" not in kwargs:
+            kwargs["messages"] = args[1]
+        args = ()
+        model = str(kwargs.get("model", ""))
+        messages = kwargs.get("messages") or []
+        logging_obj = kwargs.get("litellm_logging_obj")
+        start_time = datetime.datetime.now()
+
+        # Google Antigravity (Gemini) Bridge
+        if _is_gemini_model(model):
+            google_token = _token_manager.get_google_token()
+            google_project = _token_manager.get_google_project_id()
+            if google_token:
+                tools = kwargs.get("tools")
+                if kwargs.get("stream", False):
+                    return _logged_bridge_stream(
+                        _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs),
+                        logging_obj, messages, start_time,
+                    )
+                else:
+                    loop = asyncio.get_event_loop()
+                    content, tool_calls, usage = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
+                    msg = {"role": "assistant"}
+                    if tool_calls:
+                        msg["tool_calls"] = tool_calls
+                        finish_reason = "tool_calls"
+                    else:
+                        msg["content"] = content
+                        finish_reason = "stop"
+                    response = ModelResponse(
+                        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        object="chat.completion",
+                        created=int(time.time()),
+                        model=model,
+                        choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                        usage=usage
+                    )
+                    await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                    return response
+
+        # OpenAI Codex Bridge
+        if _is_codex_model(model):
+            _strip_codex_output_limits(kwargs)
+            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not codex_token:
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            tools = kwargs.get("tools")
+            if kwargs.get("stream", False):
+                return _logged_bridge_stream(
+                    _stream_codex_generator(model, messages, codex_token, tools=tools, extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
+                )
+            else:
+                loop = asyncio.get_event_loop()
+                content, tool_calls, usage = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
+                msg = {"role": "assistant"}
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls"
+                else:
+                    msg["content"] = content
+                    finish_reason = "stop"
+                response = ModelResponse(
+                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    object="chat.completion",
+                    created=int(time.time()),
+                    model=model,
+                    choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                    usage=usage
+                )
+                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                return response
+
+        return await _orig_acompletion(*args, **_inject_claude_prompt(kwargs, args))
+
+    _orig_completion = litellm.main.completion
+    def _wrapped_completion(*args, **kwargs):
+        # Normalise positional args (model, messages) into kwargs
+        if len(args) > 0 and "model" not in kwargs:
+            kwargs["model"] = args[0]
+        if len(args) > 1 and "messages" not in kwargs:
+            kwargs["messages"] = args[1]
+        args = ()
+        model = str(kwargs.get("model", ""))
+        messages = kwargs.get("messages") or []
+
+        # Google Antigravity (Gemini) Bridge
+        if _is_gemini_model(model):
+            google_token = _token_manager.get_google_token()
+            google_project = _token_manager.get_google_project_id()
+            if google_token:
+                tools = kwargs.get("tools")
+                content, tool_calls, usage = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
+                msg = {"role": "assistant"}
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls"
+                else:
+                    msg["content"] = content
+                    finish_reason = "stop"
+                return ModelResponse(
+                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    object="chat.completion",
+                    created=int(time.time()),
+                    model=model,
+                    choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                    usage=usage
+                )
+
+        # OpenAI Codex Bridge
+        if _is_codex_model(model):
+            _strip_codex_output_limits(kwargs)
+            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not codex_token:
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            tools = kwargs.get("tools")
+            content, tool_calls, usage = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
+            msg = {"role": "assistant"}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+                finish_reason = "tool_calls"
+            else:
+                msg["content"] = content
+                finish_reason = "stop"
+            return ModelResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                object="chat.completion",
+                created=int(time.time()),
+                model=model,
+                choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                usage=usage
+            )
+        return _orig_completion(*args, **_inject_claude_prompt(kwargs, args))
+    # Proxy routes through Router.acompletion/completion, not necessarily the
+    # module functions above. Intercept both paths before LiteLLM translates
+    # OpenAI max_tokens into the unsupported Responses max_output_tokens.
+    _orig_router_acompletion = litellm.Router.acompletion
+    async def _wrapped_router_acompletion(self, model, messages, stream=False, **kwargs):
+        logging_obj = kwargs.get("litellm_logging_obj")
+        start_time = datetime.datetime.now()
+        if _is_gemini_model(model):
+            token = _token_manager.get_google_token()
+            if token:
+                project = _token_manager.get_google_project_id()
+                if stream:
+                    return _logged_bridge_stream(
+                        _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
+                        logging_obj, messages, start_time,
+                    )
+                content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
+                    None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
+                )
+                message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
+                response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
+                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                return response
+        if _is_codex_model(model):
+            _strip_codex_output_limits(kwargs)
+            token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not token:
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            if stream:
+                return _logged_bridge_stream(
+                    _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
+                )
+            content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
+                None, _call_codex_sync, model, messages, token, kwargs.get("tools"), kwargs
+            )
+            message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
+            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
+            await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+            return response
+        return await _orig_router_acompletion(self, model=model, messages=messages, stream=stream, **kwargs)
+
+    _orig_router_completion = litellm.Router.completion
+    def _wrapped_router_completion(self, model, messages, **kwargs):
+        if _is_gemini_model(model) or _is_codex_model(model):
+            raise RuntimeError("LiteLLM proxy must route managed subscription models asynchronously")
+        return _orig_router_completion(self, model=model, messages=messages, **kwargs)
+
+    litellm.Router.acompletion = _wrapped_router_acompletion
+    litellm.Router.completion = _wrapped_router_completion
+
+
+    # Proxy preprocessing can inject max_output_tokens after Router receives the
+    # original kwargs. Strip it at route_request, the final shared boundary.
+    import litellm.proxy.route_llm_request as _route_module
+    _orig_route_request = _route_module.route_request
+    async def _wrapped_route_request(data, *args, **kwargs):
+        if _is_codex_model(str(data.get("model", ""))):
+            _strip_codex_output_limits(data)
+        return await _orig_route_request(data, *args, **kwargs)
+    _route_module.route_request = _wrapped_route_request
+    try:
+        import litellm.proxy.common_request_processing as _common_processing
+        _common_processing.route_request = _wrapped_route_request
+    except Exception as _route_patch_error:
+        print(f"[sitecustomize] route_request patch ignored: {_route_patch_error}", file=sys.stderr)
+
+    # Bind onto litellm's main modules
+    litellm.acompletion = _wrapped_acompletion
+    litellm.main.acompletion = _wrapped_acompletion
+    litellm.completion = _wrapped_completion
+    litellm.main.completion = _wrapped_completion
+
+
+    # --- 5. LiteLLM custom callback that preserves Anthropic caching at the proxy layer ---
+    try:
+        from litellm.integrations.custom_logger import CustomLogger
+        class AnthropicCacheHandler(CustomLogger):
+            def __init__(self):
+                pass
+            async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                try:
+                    model = str(data.get("model", "")).lower()
+                    if "claude" in model or "anthropic" in model:
+                        _inject_claude_prompt(data)
+                    elif _is_codex_model(model):
+                        _strip_codex_output_limits(data)
+                except Exception as e:
+                    print(f"[AnthropicCacheHandler] Hook failed: {e}", file=sys.stderr)
+                return data
+
+        _anthropic_cache_logger = AnthropicCacheHandler()
+        if _anthropic_cache_logger not in litellm.callbacks:
+            litellm.callbacks.append(_anthropic_cache_logger)
+        print("[sitecustomize] AnthropicCacheHandler registered in litellm.callbacks", file=sys.stderr)
+    except Exception as _cb_err:
+        print(f"[sitecustomize] Warning registering Anthropic callback: {_cb_err}", file=sys.stderr)
+    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity with auto-refresh and StreamingChoices enabled", file=sys.stderr)
+except Exception as _e:
+    print(f"[sitecustomize] Failed to load litellm bridges: {_e}", file=sys.stderr)

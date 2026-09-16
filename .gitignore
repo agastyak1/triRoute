@@ -1,0 +1,16 @@
+# Secrets — never commit
+config/.env
+data/
+!data/.gitkeep
+logs/
+
+# Runtime artifacts
+*.log
+credentials.json
+session_cache.db
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,47 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: triroute_litellm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:4000"
+    env_file:
+      - ./config/.env
+    environment:
+      - PYTHONPATH=/app/patch
+      - CREDENTIALS_FILE=/app/data/credentials.json
+      - CACHE_DB=/app/data/session_cache.db
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+      - ./litellm-plugin/sitecustomize.py:/app/patch/sitecustomize.py:ro
+      - ./data:/app/data:rw
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+      - "--workers"
+      - "1"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3); sys.exit(0 if r.status==200 else 1)\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  dashboard:
+    build: ./vendor/tokengateway/dashboard
+    container_name: triroute_dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3737:3737"
+    env_file:
+      - ./config/.env
+    environment:
+      - PORT=3737
+      - CREDENTIALS_PATH=/app/data/credentials.json
+      # The LiteLLM bridge owns token refresh; two refreshers racing on
+      # single-use rotating refresh tokens causes invalid_grant revocation.
+      - OAUTH_SWEEP=off
+    volumes:
+      - ./data:/app/data:rw

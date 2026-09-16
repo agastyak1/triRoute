@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# TriRoute isolated Claude Code launcher.
+# Injects gateway env into a subshell only — never touches ~/.claude or dotfiles.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${SCRIPT_DIR}/config/.env"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "error: configuration not found at ${ENV_FILE} — run install.sh first" >&2
+  exit 1
+fi
+
+LITELLM_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' "$ENV_FILE" | cut -d '=' -f2- || true)"
+
+if [[ -z "${LITELLM_MASTER_KEY}" ]]; then
+  echo "error: LITELLM_MASTER_KEY is empty in ${ENV_FILE}" >&2
+  exit 1
+fi
+
+# Direct Anthropic credentials must never bypass the gateway.
+unset ANTHROPIC_API_KEY
+unset CLAUDE_API_KEY
+
+exec env \
+  ANTHROPIC_BASE_URL="http://127.0.0.1:4000" \
+  ANTHROPIC_AUTH_TOKEN="${LITELLM_MASTER_KEY}" \
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW=250000 \
+  claude "$@"
