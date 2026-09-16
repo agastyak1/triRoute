@@ -80,8 +80,14 @@ _INSECURE_MASTER_KEYS = {
     "sk-1234",
     "sk-12345",
 }
-_mk = os.environ.get("LITELLM_MASTER_KEY", "")
-if _mk in _INSECURE_MASTER_KEYS or len(_mk) < 16:
+
+def _master_key_ok(key):
+    """Pure predicate (unit-testable): reject unset/short/known-default keys."""
+    if not key or key in _INSECURE_MASTER_KEYS:
+        return False
+    return len(key) >= 16
+
+if not _master_key_ok(os.environ.get("LITELLM_MASTER_KEY", "")):
     sys.stderr.write(
         "[sitecustomize] FATAL: LITELLM_MASTER_KEY is unset, shorter than 16 chars,\n"
         "[sitecustomize] or a known upstream default (TG-004). Generate one with\n"
@@ -427,14 +433,14 @@ def _fresh_anthropic_or_die():
 try:
     from litellm.llms.anthropic import common_utils as _anth_cu
 
-    _orig_get_anthropic_headers = _anth_cu.AnthropicConfig.get_anthropic_headers
+    _orig_get_anthropic_headers = _anth_cu.AnthropicModelInfo.get_anthropic_headers
 
     def _swapped_get_anthropic_headers(self, *args, **kwargs):
         if kwargs.get("api_key") == ANTHROPIC_OAUTH_SENTINEL:
             kwargs["api_key"] = _fresh_anthropic_or_die()
         return _orig_get_anthropic_headers(self, *args, **kwargs)
 
-    _anth_cu.AnthropicConfig.get_anthropic_headers = _swapped_get_anthropic_headers
+    _anth_cu.AnthropicModelInfo.get_anthropic_headers = _swapped_get_anthropic_headers
 
     _orig_opt_oauth = _anth_cu.optionally_handle_anthropic_oauth
 
@@ -469,6 +475,41 @@ except Exception as _swap_err:
 
 
 # --- 3. Wire protocol adapters for Claude Code, OpenAI Codex, and Google Antigravity ---
+# TriRoute: requests arrive under user-facing aliases ("claude-gpt") but the
+# bridge matchers/payload builders speak deployment model strings. Canonicalize
+# at every interception point. Keep in sync with config/litellm.yaml.
+TRIROUTE_ALIAS_BACKEND = {
+    "claude-gpt": "gpt-5.6-terra",
+    "claude-gpt-fast": "gpt-5.6-luna",
+    "claude-gemini-pro": "gemini-2.5-pro",
+    "claude-gemini-flash": "gemini-2.5-flash",
+}
+
+def _canonical_model(model_str):
+    raw = str(model_str).split("/")[-1]
+    return TRIROUTE_ALIAS_BACKEND.get(raw, str(model_str))
+
+def _require_codex_token():
+    token = _token_manager.get_codex_token()
+    if not token:
+        raise RuntimeError(
+            "ChatGPT/Codex subscription not authenticated. Open http://127.0.0.1:3737 "
+            "and click Connect under OpenAI Codex, or run scripts/auth_helper.py openai.")
+    return token
+
+def _require_google_token():
+    token = _token_manager.get_google_token()
+    if not token:
+        raise RuntimeError(
+            "Google AI Pro subscription not authenticated. Open http://127.0.0.1:3737 "
+            "and click Connect under Google Antigravity, or run scripts/auth_helper.py google.")
+    project = _token_manager.get_google_project_id()
+    if not project:
+        raise RuntimeError(
+            "Google Antigravity project id unavailable — re-run scripts/auth_helper.py google "
+            "or re-login via the dashboard.")
+    return token, project
+
 # Anthropic OAuth validates this exact Agent SDK identity as the sole system message.
 CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
@@ -1548,49 +1589,46 @@ try:
         if len(args) > 1 and "messages" not in kwargs:
             kwargs["messages"] = args[1]
         args = ()
-        model = str(kwargs.get("model", ""))
+        model = _canonical_model(kwargs.get("model", ""))
         messages = kwargs.get("messages") or []
         logging_obj = kwargs.get("litellm_logging_obj")
         start_time = datetime.datetime.now()
 
-        # Google Antigravity (Gemini) Bridge
+        # Google Antigravity (Gemini) Bridge — TriRoute: required token, never
+        # silently fall through to the dummy deployment key.
         if _is_gemini_model(model):
-            google_token = _token_manager.get_google_token()
-            google_project = _token_manager.get_google_project_id()
-            if google_token:
-                tools = kwargs.get("tools")
-                if kwargs.get("stream", False):
-                    return _logged_bridge_stream(
-                        _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs),
-                        logging_obj, messages, start_time,
-                    )
+            google_token, google_project = _require_google_token()
+            tools = kwargs.get("tools")
+            if kwargs.get("stream", False):
+                return _logged_bridge_stream(
+                    _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
+                )
+            else:
+                loop = asyncio.get_event_loop()
+                content, tool_calls, usage = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
+                msg = {"role": "assistant"}
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls"
                 else:
-                    loop = asyncio.get_event_loop()
-                    content, tool_calls, usage = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
-                    msg = {"role": "assistant"}
-                    if tool_calls:
-                        msg["tool_calls"] = tool_calls
-                        finish_reason = "tool_calls"
-                    else:
-                        msg["content"] = content
-                        finish_reason = "stop"
-                    response = ModelResponse(
-                        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                        object="chat.completion",
-                        created=int(time.time()),
-                        model=model,
-                        choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                        usage=usage
-                    )
-                    await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
-                    return response
+                    msg["content"] = content
+                    finish_reason = "stop"
+                response = ModelResponse(
+                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    object="chat.completion",
+                    created=int(time.time()),
+                    model=model,
+                    choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                    usage=usage
+                )
+                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                return response
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
             _strip_codex_output_limits(kwargs)
-            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
-            if not codex_token:
-                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            codex_token = _require_codex_token()
             tools = kwargs.get("tools")
             if kwargs.get("stream", False):
                 return _logged_bridge_stream(
@@ -1628,38 +1666,34 @@ try:
         if len(args) > 1 and "messages" not in kwargs:
             kwargs["messages"] = args[1]
         args = ()
-        model = str(kwargs.get("model", ""))
+        model = _canonical_model(kwargs.get("model", ""))
         messages = kwargs.get("messages") or []
 
         # Google Antigravity (Gemini) Bridge
         if _is_gemini_model(model):
-            google_token = _token_manager.get_google_token()
-            google_project = _token_manager.get_google_project_id()
-            if google_token:
-                tools = kwargs.get("tools")
-                content, tool_calls, usage = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
-                msg = {"role": "assistant"}
-                if tool_calls:
-                    msg["tool_calls"] = tool_calls
-                    finish_reason = "tool_calls"
-                else:
-                    msg["content"] = content
-                    finish_reason = "stop"
-                return ModelResponse(
-                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    object="chat.completion",
-                    created=int(time.time()),
-                    model=model,
-                    choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                    usage=usage
-                )
+            google_token, google_project = _require_google_token()
+            tools = kwargs.get("tools")
+            content, tool_calls, usage = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
+            msg = {"role": "assistant"}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+                finish_reason = "tool_calls"
+            else:
+                msg["content"] = content
+                finish_reason = "stop"
+            return ModelResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                object="chat.completion",
+                created=int(time.time()),
+                model=model,
+                choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
+                usage=usage
+            )
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
             _strip_codex_output_limits(kwargs)
-            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
-            if not codex_token:
-                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            codex_token = _require_codex_token()
             tools = kwargs.get("tools")
             content, tool_calls, usage = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             msg = {"role": "assistant"}
@@ -1683,29 +1717,26 @@ try:
     # OpenAI max_tokens into the unsupported Responses max_output_tokens.
     _orig_router_acompletion = litellm.Router.acompletion
     async def _wrapped_router_acompletion(self, model, messages, stream=False, **kwargs):
+        model = _canonical_model(model)
         logging_obj = kwargs.get("litellm_logging_obj")
         start_time = datetime.datetime.now()
         if _is_gemini_model(model):
-            token = _token_manager.get_google_token()
-            if token:
-                project = _token_manager.get_google_project_id()
-                if stream:
-                    return _logged_bridge_stream(
-                        _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
-                        logging_obj, messages, start_time,
-                    )
-                content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
-                    None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
+            token, project = _require_google_token()
+            if stream:
+                return _logged_bridge_stream(
+                    _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
                 )
-                message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
-                response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
-                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
-                return response
+            content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
+                None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
+            )
+            message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
+            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
+            await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+            return response
         if _is_codex_model(model):
             _strip_codex_output_limits(kwargs)
-            token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
-            if not token:
-                raise Exception("OpenAI Codex OAuth token unavailable or expired")
+            token = _require_codex_token()
             if stream:
                 return _logged_bridge_stream(
                     _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
@@ -1722,6 +1753,7 @@ try:
 
     _orig_router_completion = litellm.Router.completion
     def _wrapped_router_completion(self, model, messages, **kwargs):
+        model = _canonical_model(model)
         if _is_gemini_model(model) or _is_codex_model(model):
             raise RuntimeError("LiteLLM proxy must route managed subscription models asynchronously")
         return _orig_router_completion(self, model=model, messages=messages, **kwargs)
@@ -1735,7 +1767,7 @@ try:
     import litellm.proxy.route_llm_request as _route_module
     _orig_route_request = _route_module.route_request
     async def _wrapped_route_request(data, *args, **kwargs):
-        if _is_codex_model(str(data.get("model", ""))):
+        if _is_codex_model(_canonical_model(str(data.get("model", "")))):
             _strip_codex_output_limits(data)
         return await _orig_route_request(data, *args, **kwargs)
     _route_module.route_request = _wrapped_route_request
@@ -1760,11 +1792,15 @@ try:
                 pass
             async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
                 try:
-                    model = str(data.get("model", "")).lower()
-                    if "claude" in model or "anthropic" in model:
-                        _inject_claude_prompt(data)
-                    elif _is_codex_model(model):
+                    # TriRoute: canonicalize aliases first — "claude-gpt" contains
+                    # "claude" and must NOT be treated as an Anthropic subscription call.
+                    model = _canonical_model(str(data.get("model", ""))).lower()
+                    if _is_codex_model(model):
                         _strip_codex_output_limits(data)
+                    elif _is_gemini_model(model):
+                        pass
+                    elif "claude" in model or "anthropic" in model:
+                        _inject_claude_prompt(data)
                 except Exception as e:
                     print(f"[AnthropicCacheHandler] Hook failed: {e}", file=sys.stderr)
                 return data
